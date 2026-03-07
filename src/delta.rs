@@ -3,6 +3,7 @@ use std::collections::HashMap;
 const PREFIX_LEN: usize = 32;
 const TOLERANCE: usize = 4;
 const MIN_BYTES_SAVED: i32 = 8;
+const MAP_BITS: u32 = 20; // 1M slots per map, ~12 MB each
 
 // ── Gear hash (u32 → 32-byte effective window, matching PREFIX_LEN) ─────────
 
@@ -35,6 +36,60 @@ fn gear_init(data: &[u8], start: usize, len: usize) -> u32 {
 
 fn gear_roll(h: u32, new_byte: u8) -> u32 {
     h.wrapping_shl(1).wrapping_add(GEAR[new_byte as usize])
+}
+
+// ── Fixed-size hash map with O(1) clear ──────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct Slot {
+    gen: u32,
+    key: u32,
+    val: u32,
+}
+
+struct FixedMap {
+    mask: usize,
+    gen: u32,
+    slots: Vec<Slot>,
+}
+
+impl FixedMap {
+    fn new() -> Self {
+        let size = 1usize << MAP_BITS;
+        Self {
+            mask: size - 1,
+            gen: 1,
+            slots: vec![Slot { gen: 0, key: 0, val: 0 }; size],
+        }
+    }
+
+    fn get(&self, key: u32) -> Option<u32> {
+        let idx = key as usize & self.mask;
+        let s = &self.slots[idx];
+        if s.gen == self.gen && s.key == key {
+            Some(s.val)
+        } else {
+            None
+        }
+    }
+
+    /// Insert if the slot is empty (keeps first occurrence per generation).
+    fn insert(&mut self, key: u32, val: u32) {
+        let idx = key as usize & self.mask;
+        if self.slots[idx].gen != self.gen {
+            self.slots[idx] = Slot { gen: self.gen, key, val };
+        }
+    }
+
+    fn clear(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            for s in &mut self.slots {
+                s.gen = 0;
+            }
+            self.gen = 1;
+        }
+    }
 }
 
 // ── Varint codec ─────────────────────────────────────────────────────────────
@@ -211,8 +266,8 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
     let mut final_deltas: Vec<DeltaEntry> = Vec::new();
 
     for pass in 0..2u8 {
-        let mut base_map: HashMap<u32, u32> = HashMap::new();
-        let mut ver_map: HashMap<u32, u32> = HashMap::new();
+        let mut base_map = FixedMap::new();
+        let mut ver_map = FixedMap::new();
 
         let mut deltas: HashMap<i32, DeltaEntry> = HashMap::new();
 
@@ -233,13 +288,13 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
             // Try to find a cross-file match: base hash in version map,
             // or version hash in base map.
             let match_pair = ver_map
-                .get(&h_b)
-                .and_then(|&vp| {
+                .get(h_b)
+                .and_then(|vp| {
                     bufs_eq(base, b_offset, version, vp as usize, PREFIX_LEN)
                         .then_some((b_offset, vp as usize))
                 })
                 .or_else(|| {
-                    base_map.get(&h_v).and_then(|&bp| {
+                    base_map.get(h_v).and_then(|bp| {
                         bufs_eq(base, bp as usize, version, v_offset, PREFIX_LEN)
                             .then_some((bp as usize, v_offset))
                     })
@@ -403,8 +458,8 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
                 ver_map.clear();
                 v_start = v_offset;
             } else {
-                base_map.entry(h_b).or_insert(b_offset as u32);
-                ver_map.entry(h_v).or_insert(v_offset as u32);
+                base_map.insert(h_b, b_offset as u32);
+                ver_map.insert(h_v, v_offset as u32);
             }
 
             // Check if a match (or prior state) already consumed all of version
