@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 const PREFIX_LEN: usize = 32;
 const TOLERANCE: usize = 4;
-const HASH_SIZE: usize = 0x10000;
-const HASH_MASK: u32 = (HASH_SIZE - 1) as u32;
 const MIN_BYTES_SAVED: i32 = 8;
 
 // ── Gear hash (u32 → 32-byte effective window, matching PREFIX_LEN) ─────────
@@ -199,13 +197,6 @@ struct DeltaEntry {
     offsets: Vec<u32>,
 }
 
-struct MatchEntry {
-    hash: u32,
-    is_base: bool,
-    offset: u32,
-    next: u32, // 0 = end of chain
-}
-
 pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
     let mut w = Writer::new();
     w.write_varint(version.len() as u32);
@@ -220,16 +211,8 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
     let mut final_deltas: Vec<DeltaEntry> = Vec::new();
 
     for pass in 0..2u8 {
-        let mut hash_run: Vec<u16> = vec![0; HASH_SIZE];
-        let mut hash_first: Vec<u32> = vec![0; HASH_SIZE];
-        let mut mtab: Vec<MatchEntry> = Vec::with_capacity(0x4000);
-        // Index 0 is a sentinel (never used as a real entry)
-        mtab.push(MatchEntry {
-            hash: 0,
-            is_base: false,
-            offset: 0,
-            next: 0,
-        });
+        let mut base_map: HashMap<u32, u32> = HashMap::new();
+        let mut ver_map: HashMap<u32, u32> = HashMap::new();
 
         let mut deltas: HashMap<i32, DeltaEntry> = HashMap::new();
 
@@ -240,7 +223,6 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
         let mut v_offset: usize = 0;
         let mut b_offset: usize = 0;
         let mut b_last_copy: usize = 0;
-        let mut run: u16 = 1;
 
         // For hunk delta-encoding (pass 1 only)
         let mut prev_vs: u32 = 0;
@@ -248,229 +230,182 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
         let mut prev_bc: u32 = 0;
 
         loop {
-            let mut _found_match = false;
+            // Try to find a cross-file match: base hash in version map,
+            // or version hash in base map.
+            let match_pair = ver_map
+                .get(&h_b)
+                .and_then(|&vp| {
+                    bufs_eq(base, b_offset, version, vp as usize, PREFIX_LEN)
+                        .then_some((b_offset, vp as usize))
+                })
+                .or_else(|| {
+                    base_map.get(&h_v).and_then(|&bp| {
+                        bufs_eq(base, bp as usize, version, v_offset, PREFIX_LEN)
+                            .then_some((bp as usize, v_offset))
+                    })
+                });
 
-            for file_idx in 0..2u8 {
-                let (is_base, h, offset) = if file_idx == 0 {
-                    (true, h_b, b_offset)
-                } else {
-                    (false, h_v, v_offset)
-                };
+            if let Some((mut b_copy, mut v_copy)) = match_pair {
+                // ── Backward scan ──
+                let mut ahead: usize = 0;
+                let mut faults: usize = 0;
 
-                let bucket = (h & HASH_MASK) as usize;
-                let mut idx =
-                    if hash_run[bucket] == run { hash_first[bucket] } else { 0 };
-                let mut prev_link: u32 = 0;
+                while b_copy
+                    .checked_sub(ahead + 1)
+                    .is_some_and(|v| v >= b_last_copy)
+                    && v_copy
+                        .checked_sub(ahead + 1)
+                        .is_some_and(|v| v >= v_start)
+                {
+                    ahead += 1;
+                    let cb = get_byte(base, b_copy - ahead);
+                    let cv = get_byte(version, v_copy - ahead);
 
-                while idx != 0 && mtab[idx as usize].hash != h {
-                    prev_link = idx;
-                    idx = mtab[idx as usize].next;
+                    if cb != cv {
+                        faults += 1;
+                    } else if faults > 0 {
+                        let d = get_delta_val(
+                            base,
+                            b_copy - (ahead - 1),
+                            version,
+                            v_copy - (ahead - 1),
+                            faults,
+                            little_endian,
+                        );
+                        if !dead_ends.is_empty()
+                            && dead_ends.binary_search(&d).is_ok()
+                        {
+                            ahead = 0;
+                            faults = 0;
+                            break;
+                        }
+                        faults = 0;
+                    }
+                    if faults > TOLERANCE {
+                        ahead -= faults;
+                        break;
+                    }
                 }
 
-                if idx != 0 {
-                    let m_is_base = mtab[idx as usize].is_base;
-                    let m_offset = mtab[idx as usize].offset as usize;
+                if ahead > 0 && faults > 0 {
+                    let d = get_delta_val(
+                        base,
+                        b_copy - ahead,
+                        version,
+                        v_copy - ahead,
+                        faults,
+                        little_endian,
+                    );
+                    if !dead_ends.is_empty()
+                        && dead_ends.binary_search(&d).is_ok()
+                    {
+                        ahead -= faults;
+                    }
+                }
 
-                    // Only match across different files
-                    if m_is_base != is_base {
-                        let (cur_data, cur_off) =
-                            if is_base { (base, offset) } else { (version, offset) };
-                        let (m_data, m_off) = if m_is_base {
-                            (base, m_offset)
-                        } else {
-                            (version, m_offset)
-                        };
+                faults = 0;
+                b_copy -= ahead;
+                v_copy -= ahead;
 
-                        if bufs_eq(cur_data, cur_off, m_data, m_off, PREFIX_LEN) {
-                            let (mut b_copy, mut v_copy) = if m_is_base {
-                                (m_offset, offset)
+                // ── Forward scan ──
+                let mut l: usize = 0;
+
+                // Track which delta entry (if any) should get
+                // bytes_saved credit on each forward step.
+                let mut active_delta: Option<i32> = None;
+                let mut scan_broke = false;
+
+                while v_copy + l < version.len() {
+                    let cb = get_byte(base, b_copy + l);
+                    let cv = get_byte(version, v_copy + l);
+
+                    if cb != cv {
+                        faults += 1;
+                    } else if faults > 0 {
+                        let d = get_delta_val(
+                            base,
+                            b_copy + l - faults,
+                            version,
+                            v_copy + l - faults,
+                            faults,
+                            little_endian,
+                        );
+
+                        if dead_ends.is_empty()
+                            || dead_ends.binary_search(&d).is_err()
+                        {
+                            let delta_off = if little_endian {
+                                (v_copy + l - faults) as u32
                             } else {
-                                (offset, m_offset)
+                                (v_copy + l - TOLERANCE) as u32
                             };
 
-                            // ── Backward scan ──
-                            let mut ahead: usize = 0;
-                            let mut faults: usize = 0;
-
-                            while b_copy
-                                .checked_sub(ahead + 1)
-                                .is_some_and(|v| v >= b_last_copy)
-                                && v_copy
-                                    .checked_sub(ahead + 1)
-                                    .is_some_and(|v| v >= v_start)
-                            {
-                                ahead += 1;
-                                let cb = get_byte(base, b_copy - ahead);
-                                let cv = get_byte(version, v_copy - ahead);
-
-                                if cb != cv {
-                                    faults += 1;
-                                } else if faults > 0 {
-                                    let d = get_delta_val(
-                                        base,
-                                        b_copy - (ahead - 1),
-                                        version,
-                                        v_copy - (ahead - 1),
-                                        faults,
-                                        little_endian,
-                                    );
-                                    if !dead_ends.is_empty()
-                                        && dead_ends.binary_search(&d).is_ok()
-                                    {
-                                        ahead = 0;
-                                        faults = 0;
-                                        break;
-                                    }
-                                    faults = 0;
-                                }
-                                if faults > TOLERANCE {
-                                    ahead -= faults;
-                                    break;
-                                }
-                            }
-
-                            if ahead > 0 && faults > 0 {
-                                let d = get_delta_val(
-                                    base,
-                                    b_copy - ahead,
-                                    version,
-                                    v_copy - ahead,
-                                    faults,
-                                    little_endian,
-                                );
-                                if !dead_ends.is_empty()
-                                    && dead_ends.binary_search(&d).is_ok()
-                                {
-                                    ahead -= faults;
-                                }
-                            }
-
+                            let entry = deltas
+                                .entry(d)
+                                .or_insert_with(|| DeltaEntry {
+                                    delta: d,
+                                    bytes_saved: 0,
+                                    offsets: Vec::new(),
+                                });
+                            entry.offsets.push(delta_off);
+                            active_delta = Some(d);
                             faults = 0;
-                            b_copy -= ahead;
-                            v_copy -= ahead;
-
-                            // ── Forward scan ──
-                            let mut l: usize = 0;
-
-                            // Track which delta entry (if any) should get
-                            // bytes_saved credit on each forward step.
-                            let mut active_delta: Option<i32> = None;
-                            let mut scan_broke = false;
-
-                            while v_copy + l < version.len() {
-                                let cb = get_byte(base, b_copy + l);
-                                let cv = get_byte(version, v_copy + l);
-
-                                if cb != cv {
-                                    faults += 1;
-                                } else if faults > 0 {
-                                    let d = get_delta_val(
-                                        base,
-                                        b_copy + l - faults,
-                                        version,
-                                        v_copy + l - faults,
-                                        faults,
-                                        little_endian,
-                                    );
-
-                                    if dead_ends.is_empty()
-                                        || dead_ends.binary_search(&d).is_err()
-                                    {
-                                        let delta_off = if little_endian {
-                                            (v_copy + l - faults) as u32
-                                        } else {
-                                            (v_copy + l - TOLERANCE) as u32
-                                        };
-
-                                        let entry = deltas
-                                            .entry(d)
-                                            .or_insert_with(|| DeltaEntry {
-                                                delta: d,
-                                                bytes_saved: 0,
-                                                offsets: Vec::new(),
-                                            });
-                                        entry.offsets.push(delta_off);
-                                        active_delta = Some(d);
-                                        faults = 0;
-                                    } else {
-                                        l -= faults;
-                                        scan_broke = true;
-                                        break;
-                                    }
-                                }
-
-                                if faults > TOLERANCE {
-                                    l -= faults - 1;
-                                    scan_broke = true;
-                                    break;
-                                }
-
-                                if let Some(dk) = active_delta {
-                                    if let Some(e) = deltas.get_mut(&dk) {
-                                        e.bytes_saved += 1;
-                                    }
-                                }
-                                l += 1;
-                            }
-
-                            // Only trim trailing faults when the loop exited
-                            // normally (EOF) — the break paths already adjusted l.
-                            if !scan_broke && faults > 0 {
-                                l -= faults;
-                            }
-
-                            // ── Emit hunk (pass 1) ──
-                            if pass == 1 {
-                                let vs = v_start as u32;
-                                let vc = v_copy as u32;
-                                let bc = b_copy as u32;
-                                w.write_varint(vs - prev_vs);
-                                w.write_varint(vc - prev_vc);
-                                w.write_varint(bc - prev_bc);
-                                w.write_varint(l as u32);
-                                w.write_bytes(&version[v_start..v_copy]);
-                                prev_vs = vs;
-                                prev_vc = vc;
-                                prev_bc = bc;
-                            }
-
-                            b_last_copy = b_copy;
-                            v_offset = v_copy + l;
-                            b_offset = b_copy + l;
-
-                            h_b = gear_init(base, b_offset, PREFIX_LEN);
-                            h_v = gear_init(version, v_offset, PREFIX_LEN);
-
-                            run = run.wrapping_add(1);
-                            if run == 0 {
-                                hash_run.fill(0);
-                                run = 1;
-                            }
-                            v_start = v_offset;
-                            _found_match = true;
-                            break; // break file_idx loop
+                        } else {
+                            l -= faults;
+                            scan_broke = true;
+                            break;
                         }
                     }
-                }
 
-                // No match in chain — add new entry
-                if idx == 0 {
-                    let new_idx = mtab.len() as u32;
-                    mtab.push(MatchEntry {
-                        hash: h,
-                        is_base,
-                        offset: offset as u32,
-                        next: 0,
-                    });
-
-                    if hash_run[bucket] != run {
-                        hash_run[bucket] = run;
-                        hash_first[bucket] = new_idx;
-                    } else if prev_link != 0 {
-                        mtab[prev_link as usize].next = new_idx;
+                    if faults > TOLERANCE {
+                        l -= faults - 1;
+                        scan_broke = true;
+                        break;
                     }
+
+                    if let Some(dk) = active_delta {
+                        if let Some(e) = deltas.get_mut(&dk) {
+                            e.bytes_saved += 1;
+                        }
+                    }
+                    l += 1;
                 }
-            } // end file_idx
+
+                // Only trim trailing faults when the loop exited
+                // normally (EOF) — the break paths already adjusted l.
+                if !scan_broke && faults > 0 {
+                    l -= faults;
+                }
+
+                // ── Emit hunk (pass 1) ──
+                if pass == 1 {
+                    let vs = v_start as u32;
+                    let vc = v_copy as u32;
+                    let bc = b_copy as u32;
+                    w.write_varint(vs - prev_vs);
+                    w.write_varint(vc - prev_vc);
+                    w.write_varint(bc - prev_bc);
+                    w.write_varint(l as u32);
+                    w.write_bytes(&version[v_start..v_copy]);
+                    prev_vs = vs;
+                    prev_vc = vc;
+                    prev_bc = bc;
+                }
+
+                b_last_copy = b_copy;
+                v_offset = v_copy + l;
+                b_offset = b_copy + l;
+
+                h_b = gear_init(base, b_offset, PREFIX_LEN);
+                h_v = gear_init(version, v_offset, PREFIX_LEN);
+
+                base_map.clear();
+                ver_map.clear();
+                v_start = v_offset;
+            } else {
+                base_map.entry(h_b).or_insert(b_offset as u32);
+                ver_map.entry(h_v).or_insert(v_offset as u32);
+            }
 
             // Check if a match (or prior state) already consumed all of version
             if v_offset >= version.len() {
