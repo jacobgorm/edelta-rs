@@ -22,6 +22,54 @@ fn read_file(path: &str) -> io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+// ── Endianness detection from executable headers ────────────────────────────
+
+/// Sniff endianness from ELF, Mach-O, or PE headers.
+/// Returns Some(true) for LE, Some(false) for BE, None if unknown.
+fn sniff_endianness(data: &[u8]) -> Option<bool> {
+    if data.len() < 6 {
+        return None;
+    }
+
+    // ELF: \x7fELF at bytes 0-3, byte 5 = 1 (LE) or 2 (BE)
+    if data[..4] == *b"\x7fELF" {
+        return match data[5] {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
+    }
+
+    // Mach-O / fat binary
+    if data.len() >= 4 {
+        let m = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        match m {
+            0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE => return Some(false),
+            0xCEFA_EDFE | 0xCFFA_EDFE | 0xBEBA_FECA => return Some(true),
+            _ => {}
+        }
+    }
+
+    // PE (MZ header) — always little-endian
+    if data[..2] == *b"MZ" {
+        return Some(true);
+    }
+
+    None
+}
+
+/// Resolve endianness: manual override wins, then sniff from file data, then
+/// fall back to little-endian.
+fn resolve_endianness(override_le: Option<bool>, data: &[u8]) -> bool {
+    if let Some(le) = override_le {
+        return le;
+    }
+    if let Some(le) = sniff_endianness(data) {
+        return le;
+    }
+    true // default: little-endian
+}
+
 // ── delta / patch on raw bytes ──────────────────────────────────────────────
 
 fn encode_patch(
@@ -111,13 +159,14 @@ fn do_diff(
     base_path: &str,
     version_path: &str,
     patch_out: Option<&str>,
-    little_endian: bool,
+    endian_override: Option<bool>,
     compressor: &dyn Compressor,
 ) -> io::Result<()> {
     let base = read_file(base_path)?;
     let version = read_file(version_path)?;
 
-    let out_data = encode_patch(&base, &version, little_endian, compressor)?;
+    let le = resolve_endianness(endian_override, &version);
+    let out_data = encode_patch(&base, &version, le, compressor)?;
 
     match patch_out {
         Some(path) => std::fs::write(path, &out_data)?,
@@ -125,10 +174,11 @@ fn do_diff(
     }
 
     eprintln!(
-        "base {} bytes, version {} bytes, patch {} bytes",
+        "base {} bytes, version {} bytes, patch {} bytes ({})",
         base.len(),
         version.len(),
         out_data.len(),
+        if le { "LE" } else { "BE" },
     );
     Ok(())
 }
@@ -137,7 +187,7 @@ fn do_patch(
     base_path: &str,
     output_path: &str,
     patch_in: Option<&str>,
-    little_endian: bool,
+    endian_override: Option<bool>,
     compressor: &dyn Compressor,
 ) -> io::Result<()> {
     let base = read_file(base_path)?;
@@ -151,7 +201,8 @@ fn do_patch(
         }
     };
 
-    let result = decode_patch(&base, &patch_file, little_endian, compressor)?;
+    let le = resolve_endianness(endian_override, &base);
+    let result = decode_patch(&base, &patch_file, le, compressor)?;
 
     std::fs::write(output_path, &result)?;
     eprintln!("patched {} bytes -> {} bytes", base.len(), result.len());
@@ -197,7 +248,7 @@ fn scp_full(local: &str, host: &str, remote: &str) -> io::Result<()> {
 fn do_push(
     local_path: &str,
     remote_spec: &str,
-    little_endian: bool,
+    endian_override: Option<bool>,
     compressor: &dyn Compressor,
 ) -> io::Result<()> {
     let (host, remote_path) = parse_remote(remote_spec).ok_or_else(|| {
@@ -209,6 +260,7 @@ fn do_push(
 
     let cache = cache_path(host, remote_path);
     let local_data = read_file(local_path)?;
+    let le = resolve_endianness(endian_override, &local_data);
 
     if cache.exists() {
         let cached_data = std::fs::read(&cache)?;
@@ -217,13 +269,10 @@ fn do_push(
             return Ok(());
         }
 
-        // Try incremental patch via ssh
         eprintln!("patching {local_path} -> {host}:{remote_path}");
-        let patch_data = encode_patch(&cached_data, &local_data, little_endian, compressor)?;
+        let patch_data = encode_patch(&cached_data, &local_data, le, compressor)?;
 
         let ssh_ok = (|| -> io::Result<bool> {
-            // ssh $host "edelta patch $remote $remote"
-            // pipe the patch to stdin
             let mut child = Command::new("ssh")
                 .args([host, "edelta", "patch", remote_path, remote_path])
                 .stdin(Stdio::piped())
@@ -251,7 +300,6 @@ fn do_push(
         }
     }
 
-    // Full copy fallback (or first time)
     scp_full(local_path, host, remote_path)?;
     std::fs::create_dir_all(cache.parent().unwrap())?;
     std::fs::write(&cache, &local_data)?;
@@ -263,11 +311,13 @@ fn do_push(
 fn usage(argv0: &str) -> ! {
     eprintln!("EDelta executable differ");
     eprintln!();
-    eprintln!("Usage: {argv0} [-be] delta BASE VERSION [PATCH]");
-    eprintln!("       {argv0} [-be] patch BASE OUTPUT  [PATCH]");
-    eprintln!("       {argv0} [-be] push  LOCAL HOST:PATH");
+    eprintln!("Usage: {argv0} [-le|-be] delta BASE VERSION [PATCH]");
+    eprintln!("       {argv0} [-le|-be] patch BASE OUTPUT  [PATCH]");
+    eprintln!("       {argv0} [-le|-be] push  LOCAL HOST:PATH");
     eprintln!();
-    eprintln!("  -be   Assume big-endian integer encoding (default: little-endian)");
+    eprintln!("  Endianness is auto-detected from the ELF/Mach-O/PE header.");
+    eprintln!("  -le   Force little-endian     -be   Force big-endian");
+    eprintln!();
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
     eprintln!();
     eprintln!("  push  Incrementally deploy LOCAL to a remote host via ssh.");
@@ -281,11 +331,18 @@ fn main() {
     let argv0 = args.first().map(|s| s.as_str()).unwrap_or("edelta");
 
     let mut rest = &args[1..];
-    let mut little_endian = true; // default: little-endian
+    let mut endian_override: Option<bool> = None;
 
-    if rest.first().is_some_and(|a| a == "-be") {
-        little_endian = false;
-        rest = &rest[1..];
+    match rest.first().map(|s| s.as_str()) {
+        Some("-le") => {
+            endian_override = Some(true);
+            rest = &rest[1..];
+        }
+        Some("-be") => {
+            endian_override = Some(false);
+            rest = &rest[1..];
+        }
+        _ => {}
     }
 
     if rest.len() < 2 {
@@ -304,7 +361,7 @@ fn main() {
                 rest[1].as_str(),
                 rest[2].as_str(),
                 rest.get(3).map(|s| s.as_str()),
-                little_endian,
+                endian_override,
                 &compressor,
             )
         }
@@ -316,7 +373,7 @@ fn main() {
                 rest[1].as_str(),
                 rest[2].as_str(),
                 rest.get(3).map(|s| s.as_str()),
-                little_endian,
+                endian_override,
                 &compressor,
             )
         }
@@ -324,7 +381,7 @@ fn main() {
             if rest.len() < 3 {
                 usage(argv0);
             }
-            do_push(rest[1].as_str(), rest[2].as_str(), little_endian, &compressor)
+            do_push(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor)
         }
         _ => {
             eprintln!("unknown command: {command}");
