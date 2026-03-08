@@ -9,7 +9,7 @@ use std::process::{self, Command, Stdio};
 use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"EDLT";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 
 fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;

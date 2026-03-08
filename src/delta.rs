@@ -92,12 +92,7 @@ impl FixedMap {
     }
 }
 
-// ── Varint codec ─────────────────────────────────────────────────────────────
-
-/// Swap bits 0-1 with bits 7-8 for better varint compression of aligned offsets
-fn swap_bits(x: u32) -> u32 {
-    ((x & 3) << 7) | ((x & 0x180) >> 7) | (x & 0xFFFF_FE7C)
-}
+// ── LEB128 codec ─────────────────────────────────────────────────────────────
 
 struct Writer {
     buf: Vec<u8>,
@@ -116,35 +111,16 @@ impl Writer {
         self.buf.extend_from_slice(data);
     }
 
-    fn write_varint(&mut self, v: u32) {
-        self.write_varint_rle(v, 1);
-    }
-
-    fn write_varint_rle(&mut self, v: u32, n: u32) {
-        let (width, encoded) = if v < 0x80 {
-            (1u32, v)
-        } else if v < 0x2000 {
-            (2, v | (4 << 13))
-        } else if v < 0x20_0000 {
-            (3, v | (5 << 21))
-        } else if v < 0x2000_0000 {
-            (4, v | (6 << 29))
-        } else {
-            panic!("varint overflow: {v:#x}");
-        };
-
-        let mut count = n;
-        if n > 1 && (n > 2 || width > 1) {
-            let r: u16 = (7 << 13) | (n as u16);
-            self.buf.push((r >> 8) as u8);
-            self.buf.push(r as u8);
-            count = 1;
-        }
-
-        for _ in 0..count {
-            for j in (0..width).rev() {
-                self.buf.push((encoded >> (j * 8)) as u8);
+    fn write_leb128(&mut self, v: impl Into<u64>) {
+        let mut v: u64 = v.into();
+        loop {
+            let byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                self.buf.push(byte);
+                break;
             }
+            self.buf.push(byte | 0x80);
         }
     }
 }
@@ -152,18 +128,11 @@ impl Writer {
 struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
-    rle_count: u32,
-    rle_val: u32,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            rle_count: 0,
-            rle_val: 0,
-        }
+        Self { data, pos: 0 }
     }
 
     fn byte(&mut self) -> u8 {
@@ -183,34 +152,18 @@ impl<'a> Reader<'a> {
         s
     }
 
-    fn read_varint(&mut self) -> u32 {
-        if self.rle_count > 0 {
-            self.rle_count -= 1;
-            return self.rle_val;
-        }
-
-        let h = self.byte() as u32;
-        if (h >> 5) == 7 {
-            let c = self.byte() as u32;
-            self.rle_count = ((h & 0x1F) << 8 | c) - 1;
-            let h2 = self.byte() as u32;
-            self.rle_val = self.decode_body(h2);
-            return self.rle_val;
-        }
-        self.decode_body(h)
-    }
-
-    fn decode_body(&mut self, h: u32) -> u32 {
-        if h & 0x80 == 0 {
-            h & 0x7F
-        } else {
-            let extra = (h >> 5) as usize - 3;
-            let mut v = h & 0x1F;
-            for _ in 0..extra {
-                v = v << 8 | self.byte() as u32;
+    fn read_leb128(&mut self) -> u64 {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = self.byte();
+            result |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                break;
             }
-            v
+            shift += 7;
         }
+        result
     }
 }
 
@@ -254,20 +207,22 @@ struct DeltaEntry {
 
 pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
     let mut w = Writer::new();
-    w.write_varint(version.len() as u32);
+    w.write_leb128(version.len() as u64);
 
     if version.is_empty() {
-        w.write_varint_rle(0, 4);
+        for _ in 0..4 { w.write_leb128(0u32); }
         w.write_i32be(0);
         return w.buf;
     }
 
     let mut dead_ends: Vec<i32> = Vec::new();
     let mut final_deltas: Vec<DeltaEntry> = Vec::new();
+    let mut base_map = FixedMap::new();
+    let mut ver_map = FixedMap::new();
 
     for pass in 0..2u8 {
-        let mut base_map = FixedMap::new();
-        let mut ver_map = FixedMap::new();
+        base_map.clear();
+        ver_map.clear();
 
         let mut deltas: HashMap<i32, DeltaEntry> = HashMap::new();
 
@@ -437,10 +392,10 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
                     let vs = v_start as u32;
                     let vc = v_copy as u32;
                     let bc = b_copy as u32;
-                    w.write_varint(vs - prev_vs);
-                    w.write_varint(vc - prev_vc);
-                    w.write_varint(bc - prev_bc);
-                    w.write_varint(l as u32);
+                    w.write_leb128(vs - prev_vs);
+                    w.write_leb128(vc - prev_vc);
+                    w.write_leb128(bc - prev_bc);
+                    w.write_leb128(l as u64);
                     w.write_bytes(&version[v_start..v_copy]);
                     prev_vs = vs;
                     prev_vc = vc;
@@ -468,10 +423,10 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
                     let vs = v_start as u32;
                     let vc = version.len() as u32;
                     let bc = b_offset as u32;
-                    w.write_varint(vs - prev_vs);
-                    w.write_varint(vc - prev_vc);
-                    w.write_varint(bc - prev_bc);
-                    w.write_varint(0);
+                    w.write_leb128(vs - prev_vs);
+                    w.write_leb128(vc - prev_vc);
+                    w.write_leb128(bc - prev_bc);
+                    w.write_leb128(0u32);
                     w.write_bytes(&version[v_start..]);
                 }
                 break;
@@ -488,10 +443,10 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
                     let vs = v_start as u32;
                     let vc = version.len() as u32;
                     let bc = b_offset as u32;
-                    w.write_varint(vs - prev_vs);
-                    w.write_varint(vc - prev_vc);
-                    w.write_varint(bc - prev_bc);
-                    w.write_varint(0);
+                    w.write_leb128(vs - prev_vs);
+                    w.write_leb128(vc - prev_vc);
+                    w.write_leb128(bc - prev_bc);
+                    w.write_leb128(0u32);
                     w.write_bytes(&version[v_start..]);
                 }
                 break;
@@ -511,32 +466,18 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
         }
     } // end pass
 
-    // Hunk stream terminator: 4× varint(0)
-    w.write_varint_rle(0, 4);
+    // Hunk stream terminator
+    for _ in 0..4 { w.write_leb128(0u32); }
 
     // Delta table
     for entry in &final_deltas {
         w.write_i32be(entry.delta);
-        w.write_varint(entry.offsets.len() as u32);
+        w.write_leb128(entry.offsets.len() as u64);
 
-        let mut sub: u32 = 0;
-        let mut i = 0;
-        while i < entry.offsets.len() {
-            let v = entry.offsets[i] - sub;
-
-            let mut rept: u32 = 0;
-            while i + rept as usize + 1 < entry.offsets.len()
-                && entry.offsets[i + rept as usize + 1]
-                    - entry.offsets[i + rept as usize]
-                    == v
-            {
-                rept += 1;
-            }
-
-            w.write_varint_rle(swap_bits(v), rept + 1);
-            i += rept as usize;
-            sub = entry.offsets[i];
-            i += 1;
+        let mut prev: u32 = 0;
+        for &off in &entry.offsets {
+            w.write_leb128(off - prev);
+            prev = off;
         }
     }
 
@@ -551,7 +492,7 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
 pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<u8>, String> {
     let mut r = Reader::new(patch_data);
 
-    let version_len = r.read_varint() as usize;
+    let version_len = r.read_leb128() as usize;
     let mut dest = vec![0u8; version_len];
 
     // Read hunks
@@ -560,10 +501,10 @@ pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<
     let mut b_copy: usize = 0;
 
     loop {
-        let vsd = r.read_varint() as usize;
-        let vcd = r.read_varint() as usize;
-        let bcd = r.read_varint() as usize;
-        let l = r.read_varint() as usize;
+        let vsd = r.read_leb128() as usize;
+        let vcd = r.read_leb128() as usize;
+        let bcd = r.read_leb128() as usize;
+        let l = r.read_leb128() as usize;
 
         if l == 0 && vsd == 0 && vcd == 0 && bcd == 0 {
             break;
@@ -598,11 +539,11 @@ pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<
         }
 
         let width = TOLERANCE;
-        let num_elems = r.read_varint() as usize;
+        let num_elems = r.read_leb128() as usize;
         let mut offset: u32 = 0;
 
         for _ in 0..num_elems {
-            offset += swap_bits(r.read_varint());
+            offset += r.read_leb128() as u32;
             let off = offset as usize;
 
             if little_endian {
@@ -692,29 +633,12 @@ mod tests {
     }
 
     #[test]
-    fn varint_roundtrip() {
-        for &v in &[0u32, 1, 0x7F, 0x80, 0x1FFF, 0x2000, 0x1F_FFFF, 0x20_0000, 0x1FFF_FFFF] {
+    fn leb128_roundtrip() {
+        for &v in &[0u64, 1, 0x7F, 0x80, 0x3FFF, 0x4000, 0x1F_FFFF, 0xFFFF_FFFF, 0x1_0000_0000] {
             let mut w = Writer::new();
-            w.write_varint(v);
+            w.write_leb128(v);
             let mut r = Reader::new(&w.buf);
-            assert_eq!(r.read_varint(), v, "failed for {v:#x}");
-        }
-    }
-
-    #[test]
-    fn varint_rle_roundtrip() {
-        let mut w = Writer::new();
-        w.write_varint_rle(42, 5);
-        let mut r = Reader::new(&w.buf);
-        for _ in 0..5 {
-            assert_eq!(r.read_varint(), 42);
-        }
-    }
-
-    #[test]
-    fn swap_bits_is_involution() {
-        for x in 0..1024 {
-            assert_eq!(swap_bits(swap_bits(x)), x);
+            assert_eq!(r.read_leb128(), v, "failed for {v:#x}");
         }
     }
 }
