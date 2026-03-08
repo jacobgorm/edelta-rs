@@ -2,9 +2,11 @@ mod compress;
 mod delta;
 
 use compress::{Compressor, ZstdCompressor};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::time::Instant;
 
 const MAGIC: &[u8; 4] = b"EDLT";
 const FORMAT_VERSION: u8 = 1;
@@ -209,6 +211,18 @@ fn do_patch(
     Ok(())
 }
 
+// ── formatting helpers ───────────────────────────────────────────────────────
+
+fn fmt_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 // ── push: incremental deploy to a remote host via ssh ───────────────────────
 
 fn cache_dir() -> PathBuf {
@@ -229,11 +243,12 @@ fn parse_remote(spec: &str) -> Option<(&str, &str)> {
     Some((&spec[..colon], &spec[colon + 1..]))
 }
 
-fn scp_full(local: &str, host: &str, remote: &str) -> io::Result<()> {
-    let dest = format!("{host}:{remote}");
-    eprintln!("scp {local} -> {dest}");
+fn scp_full(local: &str, host: &str, remote: &str, pb: &ProgressBar) -> io::Result<()> {
+    pb.set_message("uploading (scp)…");
     let status = Command::new("scp")
-        .args(["-C", local, &dest])
+        .args(["-C", local, &format!("{host}:{remote}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()?;
     if status.success() {
         Ok(())
@@ -258,24 +273,41 @@ fn do_push(
         )
     })?;
 
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
     let cache = cache_path(host, remote_path);
     let local_data = read_file(local_path)?;
     let le = resolve_endianness(endian_override, &local_data);
+    let file_size = local_data.len();
 
     if cache.exists() {
         let cached_data = std::fs::read(&cache)?;
         if cached_data == local_data {
-            eprintln!("{local_path}: unchanged, skipping");
+            pb.finish_and_clear();
+            eprintln!(
+                "\x1b[90m{local_path}: unchanged, skipping\x1b[0m"
+            );
             return Ok(());
         }
 
-        eprintln!("patching {local_path} -> {host}:{remote_path}");
+        pb.set_message(format!("computing delta for {local_path}…"));
+        let t0 = Instant::now();
         let patch_data = encode_patch(&cached_data, &local_data, le, compressor)?;
+        let delta_time = t0.elapsed();
 
+        pb.set_message(format!("patching {host}:{remote_path}…"));
+        let t0 = Instant::now();
         let ssh_ok = (|| -> io::Result<bool> {
             let mut child = Command::new("ssh")
                 .args([host, "edelta", "patch", remote_path, remote_path])
                 .stdin(Stdio::piped())
+                .stderr(Stdio::null())
                 .spawn()?;
 
             child.stdin.take().unwrap().write_all(&patch_data)?;
@@ -283,26 +315,46 @@ fn do_push(
             let status = child.wait()?;
             Ok(status.success())
         })();
+        let transfer_time = t0.elapsed();
 
         match ssh_ok {
             Ok(true) => {
                 std::fs::create_dir_all(cache.parent().unwrap())?;
                 std::fs::write(&cache, &local_data)?;
+                pb.finish_and_clear();
+
+                let speedup = file_size as f64 / patch_data.len() as f64;
+                let total_ms = (delta_time + transfer_time).as_millis();
                 eprintln!(
-                    "done ({} byte patch for {} byte file)",
-                    patch_data.len(),
-                    local_data.len()
+                    "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+                     \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
+                     (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
+                    fmt_size(patch_data.len()),
+                    fmt_size(file_size),
+                    speedup,
                 );
                 return Ok(());
             }
-            Ok(false) => eprintln!("ssh patch failed, falling back to scp"),
-            Err(e) => eprintln!("ssh patch error: {e}, falling back to scp"),
+            Ok(false) => {
+                pb.set_message("ssh patch failed, falling back to scp…");
+            }
+            Err(e) => {
+                pb.set_message(format!("ssh error: {e}, falling back to scp…"));
+            }
         }
     }
 
-    scp_full(local_path, host, remote_path)?;
+    let t0 = Instant::now();
+    scp_full(local_path, host, remote_path, &pb)?;
+    let elapsed = t0.elapsed().as_millis();
     std::fs::create_dir_all(cache.parent().unwrap())?;
     std::fs::write(&cache, &local_data)?;
+    pb.finish_and_clear();
+    eprintln!(
+        "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+         \x1b[1m{}\x1b[0m (full copy, {elapsed} ms)",
+        fmt_size(file_size),
+    );
     Ok(())
 }
 
