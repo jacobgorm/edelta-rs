@@ -227,12 +227,36 @@ fn fmt_size(bytes: usize) -> String {
 
 fn cache_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home).join(".edelta")
+    Path::new(&home).join(".edelta").join("cache")
 }
 
-fn cache_path(host: &str, remote_path: &str) -> PathBuf {
-    let sanitized = remote_path.replace('/', "_");
-    cache_dir().join(host).join(sanitized)
+fn save_to_cache(hash: &str, data: &[u8]) -> io::Result<()> {
+    let dir = cache_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hash), data)
+}
+
+fn sha1_of_file(path: &str) -> io::Result<String> {
+    let output = Command::new("shasum").arg(path).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "shasum produced no output"))
+}
+
+fn remote_sha1(host: &str, path: &str) -> io::Result<Option<String>> {
+    let output = Command::new("ssh")
+        .args([host, &format!("shasum {path}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.split_whitespace().next().map(|s| s.to_string()))
 }
 
 fn parse_remote(spec: &str) -> Option<(&str, &str)> {
@@ -281,74 +305,81 @@ fn do_push(
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    let cache = cache_path(host, remote_path);
     let local_data = read_file(local_path)?;
     let le = resolve_endianness(endian_override, &local_data);
     let file_size = local_data.len();
+    let local_hash = sha1_of_file(local_path)?;
 
-    if cache.exists() {
-        let cached_data = std::fs::read(&cache)?;
-        if cached_data == local_data {
-            pb.finish_and_clear();
-            eprintln!(
-                "\x1b[90m{local_path}: unchanged, skipping\x1b[0m"
-            );
-            return Ok(());
-        }
+    // Ask the remote for the current file's SHA1
+    pb.set_message(format!("querying {host}:{remote_path}…"));
+    let remote_hash = remote_sha1(host, remote_path)?;
 
-        pb.set_message(format!("computing delta for {local_path}…"));
-        let t0 = Instant::now();
-        let patch_data = encode_patch(&cached_data, &local_data, le, compressor)?;
-        let delta_time = t0.elapsed();
+    // Skip if unchanged
+    if remote_hash.as_deref() == Some(local_hash.as_str()) {
+        pb.finish_and_clear();
+        eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
+        return Ok(());
+    }
 
-        pb.set_message(format!("patching {host}:{remote_path}…"));
-        let t0 = Instant::now();
-        let ssh_ok = (|| -> io::Result<bool> {
-            let mut child = Command::new("ssh")
-                .args([host, "edelta", "patch", remote_path, remote_path])
-                .stdin(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?;
+    // Try delta if we have the remote's version cached locally
+    if let Some(ref rh) = remote_hash {
+        let base_path = cache_dir().join(rh);
+        if base_path.exists() {
+            let base_data = std::fs::read(&base_path)?;
 
-            child.stdin.take().unwrap().write_all(&patch_data)?;
+            pb.set_message(format!("computing delta for {local_path}…"));
+            let t0 = Instant::now();
+            let patch_data = encode_patch(&base_data, &local_data, le, compressor)?;
+            let delta_time = t0.elapsed();
 
-            let status = child.wait()?;
-            Ok(status.success())
-        })();
-        let transfer_time = t0.elapsed();
+            pb.set_message(format!("patching {host}:{remote_path}…"));
+            let t0 = Instant::now();
+            let ssh_ok = (|| -> io::Result<bool> {
+                let mut child = Command::new("ssh")
+                    .args([host, "edelta", "patch", remote_path, remote_path])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()?;
 
-        match ssh_ok {
-            Ok(true) => {
-                std::fs::create_dir_all(cache.parent().unwrap())?;
-                std::fs::write(&cache, &local_data)?;
-                pb.finish_and_clear();
+                child.stdin.take().unwrap().write_all(&patch_data)?;
 
-                let speedup = file_size as f64 / patch_data.len() as f64;
-                let total_ms = (delta_time + transfer_time).as_millis();
-                eprintln!(
-                    "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
-                     \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
-                     (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
-                    fmt_size(patch_data.len()),
-                    fmt_size(file_size),
-                    speedup,
-                );
-                return Ok(());
-            }
-            Ok(false) => {
-                pb.set_message("ssh patch failed, falling back to scp…");
-            }
-            Err(e) => {
-                pb.set_message(format!("ssh error: {e}, falling back to scp…"));
+                let status = child.wait()?;
+                Ok(status.success())
+            })();
+            let transfer_time = t0.elapsed();
+
+            match ssh_ok {
+                Ok(true) => {
+                    save_to_cache(&local_hash, &local_data)?;
+                    pb.finish_and_clear();
+
+                    let speedup = file_size as f64 / patch_data.len() as f64;
+                    let total_ms = (delta_time + transfer_time).as_millis();
+                    eprintln!(
+                        "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+                         \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
+                         (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
+                        fmt_size(patch_data.len()),
+                        fmt_size(file_size),
+                        speedup,
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {
+                    pb.set_message("ssh patch failed, falling back to scp…");
+                }
+                Err(e) => {
+                    pb.set_message(format!("ssh error: {e}, falling back to scp…"));
+                }
             }
         }
     }
 
+    // Full copy fallback
     let t0 = Instant::now();
     scp_full(local_path, host, remote_path, &pb)?;
     let elapsed = t0.elapsed().as_millis();
-    std::fs::create_dir_all(cache.parent().unwrap())?;
-    std::fs::write(&cache, &local_data)?;
+    save_to_cache(&local_hash, &local_data)?;
     pb.finish_and_clear();
     eprintln!(
         "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
@@ -373,8 +404,8 @@ fn usage(argv0: &str) -> ! {
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
     eprintln!();
     eprintln!("  push  Incrementally deploy LOCAL to a remote host via ssh.");
-    eprintln!("        Caches the last version sent in ~/.edelta/ and only");
-    eprintln!("        transmits a delta when possible. Falls back to scp.");
+    eprintln!("        Queries the remote SHA1, looks up a cached base in");
+    eprintln!("        ~/.edelta/cache/, and sends a delta. Falls back to scp.");
     process::exit(1);
 }
 
