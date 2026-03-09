@@ -230,10 +230,42 @@ fn cache_dir() -> PathBuf {
     Path::new(&home).join(".edelta").join("cache")
 }
 
+const CACHE_MAX_FILES: usize = 5;
+const CACHE_MAX_BYTES: u64 = 1_000_000_000; // 1 GB
+
 fn save_to_cache(hash: &str, data: &[u8]) -> io::Result<()> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hash), data)
+    std::fs::write(dir.join(hash), data)?;
+    evict_cache(&dir)
+}
+
+fn touch(path: &Path) {
+    let now = filetime::FileTime::now();
+    let _ = filetime::set_file_mtime(path, now);
+}
+
+fn evict_cache(dir: &Path) -> io::Result<()> {
+    let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let meta = e.metadata()?;
+        if meta.is_file() {
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            entries.push((e.path(), meta.len(), mtime));
+        }
+    }
+    // Sort newest first
+    entries.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let mut total: u64 = 0;
+    for (i, (path, size, _)) in entries.iter().enumerate() {
+        total += size;
+        if i >= CACHE_MAX_FILES || total > CACHE_MAX_BYTES {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 fn sha1_of_file(path: &str) -> io::Result<String> {
@@ -326,6 +358,7 @@ fn do_push(
         let base_path = cache_dir().join(rh);
         if base_path.exists() {
             let base_data = std::fs::read(&base_path)?;
+            touch(&base_path);
 
             pb.set_message(format!("computing delta for {local_path}…"));
             let t0 = Instant::now();
