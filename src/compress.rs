@@ -30,7 +30,7 @@ impl ZstdCompressor {
 
 impl Default for ZstdCompressor {
     fn default() -> Self {
-        Self::new(19)
+        Self::new(3)
     }
 }
 
