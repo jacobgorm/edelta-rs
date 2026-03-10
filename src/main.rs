@@ -360,7 +360,9 @@ fn temp_path(target: &Path) -> io::Result<PathBuf> {
 
 fn mmap_file(path: &str) -> io::Result<memmap2::Mmap> {
     let file = std::fs::File::open(path)?;
-    unsafe { memmap2::Mmap::map(&file) }
+    let m = unsafe { memmap2::Mmap::map(&file)? };
+    m.advise(memmap2::Advice::WillNeed)?;
+    Ok(m)
 }
 
 fn write_and_verify(
@@ -403,6 +405,7 @@ fn write_and_verify(
     }
 
     let mut out = unsafe { MmapMut::map_mut(&out_file)? };
+    out.advise(memmap2::Advice::Sequential)?;
 
     delta::patch_into(base, patch_data, le, &mut out)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -429,7 +432,6 @@ fn write_and_verify(
         ));
     }
 
-    out.flush()?;
     Ok(())
 }
 
