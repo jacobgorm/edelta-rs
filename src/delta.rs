@@ -497,11 +497,13 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool, two_pass: bool) ->
 
 // ── Patch (decode) ───────────────────────────────────────────────────────────
 
-pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<u8>, String> {
-    let mut r = Reader::new(patch_data);
+pub fn patch_output_len(patch_data: &[u8]) -> usize {
+    Reader::new(patch_data).read_leb128() as usize
+}
 
-    let version_len = r.read_leb128() as usize;
-    let mut dest = vec![0u8; version_len];
+pub fn patch_into(base: &[u8], patch_data: &[u8], little_endian: bool, dest: &mut [u8]) -> Result<(), String> {
+    let mut r = Reader::new(patch_data);
+    let _version_len = r.read_leb128() as usize;
 
     // Read hunks
     let mut v_start: usize = 0;
@@ -522,20 +524,17 @@ pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<
         v_copy += vcd;
         b_copy += bcd;
 
-        // Copy literal data from patch
         if v_copy > v_start {
             let literal = r.read_bytes(v_copy - v_start);
             dest[v_start..v_copy].copy_from_slice(literal);
         }
 
-        // Copy from base (may extend past base; C version reads what's available)
         if l > 0 {
             let avail = base.len().saturating_sub(b_copy).min(l);
             if avail > 0 {
                 dest[v_copy..v_copy + avail]
                     .copy_from_slice(&base[b_copy..b_copy + avail]);
             }
-            // Bytes beyond base remain 0 — the delta table will fix them
         }
     }
 
@@ -582,6 +581,13 @@ pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<
         }
     }
 
+    Ok(())
+}
+
+pub fn patch(base: &[u8], patch_data: &[u8], little_endian: bool) -> Result<Vec<u8>, String> {
+    let len = patch_output_len(patch_data);
+    let mut dest = vec![0u8; len];
+    patch_into(base, patch_data, little_endian, &mut dest)?;
     Ok(dest)
 }
 

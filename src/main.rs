@@ -3,6 +3,7 @@ mod delta;
 
 use compress::{Compressor, ZstdCompressor};
 use indicatif::{ProgressBar, ProgressStyle};
+use memmap2::MmapMut;
 use sha1::{Digest, Sha1};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -98,12 +99,13 @@ fn encode_patch(
     Ok(out)
 }
 
-fn decode_patch(
+/// Parse patch header, decompress, verify base checksum.
+/// Returns (decompressed payload — patch data starts at [8..], version hash).
+fn open_patch(
     base: &[u8],
     patch_file: &[u8],
-    little_endian: bool,
     compressor: &dyn Compressor,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<(Vec<u8>, u32)> {
     if patch_file.len() < 5 || &patch_file[..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -140,6 +142,17 @@ fn decode_patch(
             ),
         ));
     }
+
+    Ok((payload, ver_hash))
+}
+
+fn decode_patch(
+    base: &[u8],
+    patch_file: &[u8],
+    little_endian: bool,
+    compressor: &dyn Compressor,
+) -> io::Result<Vec<u8>> {
+    let (payload, ver_hash) = open_patch(base, patch_file, compressor)?;
 
     let result = delta::patch(base, &payload[8..], little_endian)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -195,7 +208,7 @@ fn do_patch(
     endian_override: Option<bool>,
     compressor: &dyn Compressor,
 ) -> io::Result<()> {
-    let base = read_file(base_path)?;
+    let base = mmap_file(base_path)?;
 
     let patch_file = match patch_in {
         Some(path) => read_file(path)?,
@@ -342,21 +355,66 @@ fn temp_path(target: &Path) -> io::Result<PathBuf> {
     Ok(dir.join(format!(".{name}.{suffix}.tmp")))
 }
 
+fn mmap_file(path: &str) -> io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
 fn write_and_verify(
     tmp: &Path,
     payload: &[u8],
     expected_sha1: &[u8],
     base_path: Option<&str>,
 ) -> io::Result<()> {
-    let base_data = match base_path {
-        Some(p) => read_file(p)?,
-        None => Vec::new(),
-    };
-    let le = resolve_endianness(None, &base_data);
-    let compressor = ZstdCompressor::default();
-    let result = decode_patch(&base_data, payload, le, &compressor)?;
+    let base_mmap = base_path.map(mmap_file).transpose()?;
+    let base: &[u8] = base_mmap.as_deref().unwrap_or(&[]);
 
-    let actual = sha1_digest(&result);
+    let le = resolve_endianness(None, base);
+    let compressor = ZstdCompressor::default();
+    let (decompressed, ver_hash) = open_patch(base, payload, &compressor)?;
+    let patch_data = &decompressed[8..];
+    let version_len = delta::patch_output_len(patch_data);
+
+    // Create output file and mmap it
+    let out_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp)?;
+    out_file.set_len(version_len as u64)?;
+
+    if version_len == 0 {
+        let actual = sha1_digest(&[]);
+        if actual.as_slice() != expected_sha1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SHA1 mismatch (expected {}, got {})",
+                    sha1_hex(expected_sha1),
+                    sha1_hex(actual.as_slice()),
+                ),
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut out = unsafe { MmapMut::map_mut(&out_file)? };
+
+    delta::patch_into(base, patch_data, le, &mut out)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let actual_ver_hash = fnv1a(&out);
+    if actual_ver_hash != ver_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "output checksum mismatch (expected {ver_hash:#010x}, got {actual_ver_hash:#010x})"
+            ),
+        ));
+    }
+
+    let actual = sha1_digest(&out);
     if actual.as_slice() != expected_sha1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -368,7 +426,7 @@ fn write_and_verify(
         ));
     }
 
-    std::fs::write(tmp, &result)?;
+    out.flush()?;
     Ok(())
 }
 

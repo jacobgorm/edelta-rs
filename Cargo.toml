@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 filetime = "0.2"
 indicatif = "0.17"
+memmap2 = "0.9"
 sha1 = "0.10"
 zstd = "0.13"
