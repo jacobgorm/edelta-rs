@@ -299,21 +299,41 @@ fn parse_remote(spec: &str) -> Option<(&str, &str)> {
     Some((&spec[..colon], &spec[colon + 1..]))
 }
 
-fn scp_full(local: &str, host: &str, remote: &str, pb: &ProgressBar) -> io::Result<()> {
-    pb.set_message("uploading (scp)…");
-    let status = Command::new("scp")
-        .args(["-C", local, &format!("{host}:{remote}")])
-        .stdout(Stdio::null())
+fn ssh_upload(
+    data: &[u8],
+    host: &str,
+    remote_path: &str,
+    pb: &ProgressBar,
+) -> io::Result<()> {
+    pb.set_message(format!("uploading to {host}:{remote_path}…"));
+    let mut child = Command::new("ssh")
+        .args([host, "edelta", "receive", remote_path])
+        .stdin(Stdio::piped())
         .stderr(Stdio::null())
-        .status()?;
+        .spawn()?;
+
+    let stdin = child.stdin.take().unwrap();
+    let mut encoder = zstd::Encoder::new(stdin, 19)?;
+    encoder.write_all(data)?;
+    encoder.finish()?;
+
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("scp exited with {status}"),
+            "ssh upload failed",
         ))
     }
+}
+
+fn do_receive(output_path: &str) -> io::Result<()> {
+    let mut decoder = zstd::Decoder::new(io::stdin())?;
+    let mut data = Vec::new();
+    decoder.read_to_end(&mut data)?;
+    std::fs::write(output_path, &data)?;
+    Ok(())
 }
 
 fn do_push(
@@ -399,10 +419,10 @@ fn do_push(
                     return Ok(());
                 }
                 Ok(false) => {
-                    pb.set_message("ssh patch failed, falling back to scp…");
+                    pb.set_message("ssh patch failed, falling back to full upload…");
                 }
                 Err(e) => {
-                    pb.set_message(format!("ssh error: {e}, falling back to scp…"));
+                    pb.set_message(format!("ssh error: {e}, falling back to full upload…"));
                 }
             }
         }
@@ -410,7 +430,7 @@ fn do_push(
 
     // Full copy fallback
     let t0 = Instant::now();
-    scp_full(local_path, host, remote_path, &pb)?;
+    ssh_upload(&local_data, host, remote_path, &pb)?;
     let elapsed = t0.elapsed().as_millis();
     save_to_cache(&local_hash, &local_data)?;
     pb.finish_and_clear();
@@ -438,7 +458,8 @@ fn usage(argv0: &str) -> ! {
     eprintln!();
     eprintln!("  push  Incrementally deploy LOCAL to a remote host via ssh.");
     eprintln!("        Queries the remote SHA1, looks up a cached base in");
-    eprintln!("        ~/.edelta/cache/, and sends a delta. Falls back to scp.");
+    eprintln!("        ~/.edelta/cache/, and sends a delta. Falls back to");
+    eprintln!("        zstd-compressed full upload via ssh.");
     process::exit(1);
 }
 
@@ -498,6 +519,12 @@ fn main() {
                 usage(argv0);
             }
             do_push(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor)
+        }
+        "receive" => {
+            if rest.len() < 2 {
+                usage(argv0);
+            }
+            do_receive(rest[1].as_str())
         }
         _ => {
             eprintln!("unknown command: {command}");
