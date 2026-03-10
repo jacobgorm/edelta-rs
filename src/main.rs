@@ -3,6 +3,7 @@ mod delta;
 
 use compress::{Compressor, ZstdCompressor};
 use indicatif::{ProgressBar, ProgressStyle};
+use sha1::{Digest, Sha1};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -268,14 +269,12 @@ fn evict_cache(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn sha1_of_file(path: &str) -> io::Result<String> {
-    let output = Command::new("shasum").arg(path).output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .split_whitespace()
-        .next()
-        .map(|s| s.to_string())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "shasum produced no output"))
+fn sha1_digest(data: &[u8]) -> sha1::digest::Output<Sha1> {
+    Sha1::digest(data)
+}
+
+fn sha1_hex(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn remote_sha1(host: &str, path: &str) -> io::Result<Option<String>> {
@@ -303,6 +302,7 @@ fn ssh_upload(
     data: &[u8],
     host: &str,
     remote_path: &str,
+    sha1: &[u8],
     pb: &ProgressBar,
 ) -> io::Result<()> {
     pb.set_message(format!("uploading to {host}:{remote_path}…"));
@@ -315,7 +315,9 @@ fn ssh_upload(
     let stdin = child.stdin.take().unwrap();
     let mut encoder = zstd::Encoder::new(stdin, 19)?;
     encoder.write_all(data)?;
-    encoder.finish()?;
+    let mut stdin = encoder.finish()?;
+    stdin.write_all(sha1)?;
+    drop(stdin);
 
     let status = child.wait()?;
     if status.success() {
@@ -328,11 +330,63 @@ fn ssh_upload(
     }
 }
 
-fn do_receive(output_path: &str) -> io::Result<()> {
-    let mut decoder = zstd::Decoder::new(io::stdin())?;
-    let mut data = Vec::new();
-    decoder.read_to_end(&mut data)?;
-    std::fs::write(output_path, &data)?;
+fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+
+    if input.len() < 20 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input too short (missing SHA1 trailer)",
+        ));
+    }
+
+    let (payload, expected_sha1) = input.split_at(input.len() - 20);
+
+    let dest = Path::new(output_path);
+    let dir = dest.parent().unwrap_or(Path::new("."));
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let tmp_path = dir.join(format!(".{name}.edelta-tmp"));
+
+    let actual_sha1 = if let Some(base) = base_path {
+        // Delta mode: payload is a patch file
+        let base_data = read_file(base)?;
+        let le = resolve_endianness(None, &base_data);
+        let compressor = ZstdCompressor::default();
+        let result = decode_patch(&base_data, payload, le, &compressor)?;
+        let sha1 = sha1_digest(&result);
+        std::fs::write(&tmp_path, &result)?;
+        sha1
+    } else {
+        // Full copy mode: stream decompress, hash, and write in one pass
+        let mut decoder = zstd::Decoder::new(io::Cursor::new(payload))?;
+        let mut hasher = Sha1::new();
+        let mut file = std::fs::File::create(&tmp_path)?;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = decoder.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])?;
+        }
+        hasher.finalize()
+    };
+
+    if actual_sha1.as_slice() != expected_sha1 {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "SHA1 mismatch (expected {}, got {})",
+                sha1_hex(expected_sha1),
+                sha1_hex(actual_sha1.as_slice()),
+            ),
+        ));
+    }
+
+    std::fs::rename(&tmp_path, output_path)?;
     Ok(())
 }
 
@@ -360,7 +414,8 @@ fn do_push(
     let local_data = read_file(local_path)?;
     let le = resolve_endianness(endian_override, &local_data);
     let file_size = local_data.len();
-    let local_hash = sha1_of_file(local_path)?;
+    let local_sha1 = sha1_digest(&local_data);
+    let local_hash = sha1_hex(local_sha1.as_slice());
 
     // Ask the remote for the current file's SHA1
     pb.set_message(format!("querying {host}:{remote_path}…"));
@@ -389,12 +444,15 @@ fn do_push(
             let t0 = Instant::now();
             let ssh_ok = (|| -> io::Result<bool> {
                 let mut child = Command::new("ssh")
-                    .args([host, "edelta", "patch", remote_path, remote_path])
+                    .args([host, "edelta", "receive", remote_path, remote_path])
                     .stdin(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()?;
 
-                child.stdin.take().unwrap().write_all(&patch_data)?;
+                let mut stdin_pipe = child.stdin.take().unwrap();
+                stdin_pipe.write_all(&patch_data)?;
+                stdin_pipe.write_all(local_sha1.as_slice())?;
+                drop(stdin_pipe);
 
                 let status = child.wait()?;
                 Ok(status.success())
@@ -430,7 +488,7 @@ fn do_push(
 
     // Full copy fallback
     let t0 = Instant::now();
-    ssh_upload(&local_data, host, remote_path, &pb)?;
+    ssh_upload(&local_data, host, remote_path, local_sha1.as_slice(), &pb)?;
     let elapsed = t0.elapsed().as_millis();
     save_to_cache(&local_hash, &local_data)?;
     pb.finish_and_clear();
@@ -524,7 +582,7 @@ fn main() {
             if rest.len() < 2 {
                 usage(argv0);
             }
-            do_receive(rest[1].as_str())
+            do_receive(rest[1].as_str(), rest.get(2).map(|s| s.as_str()))
         }
         _ => {
             eprintln!("unknown command: {command}");
