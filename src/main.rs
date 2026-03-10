@@ -6,6 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::MmapMut;
 use sha1::{Digest, Sha1};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::time::Instant;
@@ -316,6 +317,7 @@ fn parse_remote(spec: &str) -> Option<(&str, &str)> {
 fn ssh_send(
     patch: &[u8],
     sha1: &[u8],
+    mode: u32,
     host: &str,
     output: &str,
     base: Option<&str>,
@@ -333,6 +335,7 @@ fn ssh_send(
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(patch)?;
     stdin.write_all(sha1)?;
+    stdin.write_all(&(mode as u16).to_be_bytes())?;
     drop(stdin);
 
     let status = child.wait()?;
@@ -434,18 +437,23 @@ fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
 
-    if input.len() < 20 {
+    if input.len() < 22 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "input too short (missing SHA1 trailer)",
+            "input too short (missing SHA1 + mode trailer)",
         ));
     }
 
-    let (payload, expected_sha1) = input.split_at(input.len() - 20);
+    let (rest, mode_bytes) = input.split_at(input.len() - 2);
+    let mode = u16::from_be_bytes([mode_bytes[0], mode_bytes[1]]) as u32;
+    let (payload, expected_sha1) = rest.split_at(rest.len() - 20);
     let tmp = temp_path(Path::new(output_path))?;
 
     match write_and_verify(&tmp, payload, expected_sha1, base_path) {
-        Ok(()) => std::fs::rename(&tmp, output_path),
+        Ok(()) => {
+            std::fs::set_permissions(&tmp, PermissionsExt::from_mode(mode))?;
+            std::fs::rename(&tmp, output_path)
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -460,12 +468,21 @@ fn do_push(
     compressor: &dyn Compressor,
     two_pass: bool,
 ) -> io::Result<()> {
-    let (host, remote_path) = parse_remote(remote_spec).ok_or_else(|| {
+    let (host, raw_remote) = parse_remote(remote_spec).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid remote spec '{remote_spec}', expected host:path"),
         )
     })?;
+
+    let remote_buf;
+    let remote_path = if raw_remote.ends_with('/') {
+        let name = Path::new(local_path).file_name().unwrap_or_default().to_string_lossy();
+        remote_buf = format!("{raw_remote}{name}");
+        &remote_buf
+    } else {
+        raw_remote
+    };
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -475,6 +492,7 @@ fn do_push(
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
+    let local_mode = std::fs::metadata(local_path)?.permissions().mode();
     let local_data = read_file(local_path)?;
     let le = resolve_endianness(endian_override, &local_data);
     let file_size = local_data.len();
@@ -515,6 +533,7 @@ fn do_push(
     let send_ok = ssh_send(
         &patch_data,
         local_sha1.as_slice(),
+        local_mode,
         host,
         remote_path,
         remote_base,
@@ -526,7 +545,7 @@ fn do_push(
         pb.set_message(format!("delta failed, resending {local_path}…"));
         let t0 = Instant::now();
         let patch_data = encode_patch(&[], &local_data, le, compressor, two_pass)?;
-        ssh_send(&patch_data, local_sha1.as_slice(), host, remote_path, None)?;
+        ssh_send(&patch_data, local_sha1.as_slice(), local_mode, host, remote_path, None)?;
         let elapsed = t0.elapsed().as_millis();
         save_to_cache(&local_hash, &local_data)?;
         pb.finish_and_clear();
