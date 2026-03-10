@@ -205,11 +205,17 @@ struct DeltaEntry {
     offsets: Vec<u32>,
 }
 
-pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
+pub fn diff(base: &[u8], version: &[u8], little_endian: bool, two_pass: bool) -> Vec<u8> {
     let mut w = Writer::new();
     w.write_leb128(version.len() as u64);
 
-    if version.is_empty() {
+    if version.is_empty() || base.is_empty() {
+        // No base or no version — emit entire version as a single literal hunk
+        w.write_leb128(0u32);
+        w.write_leb128(version.len() as u64);
+        w.write_leb128(0u32);
+        w.write_leb128(0u32);
+        w.write_bytes(version);
         for _ in 0..4 { w.write_leb128(0u32); }
         w.write_i32be(0);
         return w.buf;
@@ -220,7 +226,9 @@ pub fn diff(base: &[u8], version: &[u8], little_endian: bool) -> Vec<u8> {
     let mut base_map = FixedMap::new();
     let mut ver_map = FixedMap::new();
 
-    for pass in 0..2u8 {
+    let start_pass: u8 = if two_pass { 0 } else { 1 };
+
+    for pass in start_pass..2u8 {
         base_map.clear();
         ver_map.clear();
 
@@ -584,7 +592,7 @@ mod tests {
     #[test]
     fn roundtrip_identical() {
         let data = b"Hello, world! This is a test of the edelta algorithm.";
-        let patch_data = diff(data, data, false);
+        let patch_data = diff(data, data, false, false);
         let result = patch(data, &patch_data, false).unwrap();
         assert_eq!(result, data);
     }
@@ -593,7 +601,7 @@ mod tests {
     fn roundtrip_small_change() {
         let base = b"AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ KKKK LLLL";
         let version = b"AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ KKKK MMMM";
-        let patch_data = diff(base, version, false);
+        let patch_data = diff(base, version, false, false);
         let result = patch(base, &patch_data, false).unwrap();
         assert_eq!(result, version);
     }
@@ -602,7 +610,7 @@ mod tests {
     fn roundtrip_empty_version() {
         let base = b"some data";
         let version = b"";
-        let patch_data = diff(base, version, false);
+        let patch_data = diff(base, version, false, false);
         let result = patch(base, &patch_data, false).unwrap();
         assert_eq!(result, version.as_slice());
     }
@@ -627,7 +635,7 @@ mod tests {
             version[i] = 0xFF;
         }
 
-        let patch_data = diff(&base, &version, false);
+        let patch_data = diff(&base, &version, false, false);
         let result = patch(&base, &patch_data, false).unwrap();
         assert_eq!(result, version);
     }

@@ -80,8 +80,9 @@ fn encode_patch(
     version: &[u8],
     little_endian: bool,
     compressor: &dyn Compressor,
+    two_pass: bool,
 ) -> io::Result<Vec<u8>> {
-    let raw_patch = delta::diff(base, version, little_endian);
+    let raw_patch = delta::diff(base, version, little_endian, two_pass);
 
     let mut payload = Vec::new();
     payload.extend_from_slice(&fnv1a(base).to_be_bytes());
@@ -164,12 +165,13 @@ fn do_diff(
     patch_out: Option<&str>,
     endian_override: Option<bool>,
     compressor: &dyn Compressor,
+    two_pass: bool,
 ) -> io::Result<()> {
     let base = read_file(base_path)?;
     let version = read_file(version_path)?;
 
     let le = resolve_endianness(endian_override, &version);
-    let out_data = encode_patch(&base, &version, le, compressor)?;
+    let out_data = encode_patch(&base, &version, le, compressor, two_pass)?;
 
     match patch_out {
         Some(path) => std::fs::write(path, &out_data)?,
@@ -298,24 +300,25 @@ fn parse_remote(spec: &str) -> Option<(&str, &str)> {
     Some((&spec[..colon], &spec[colon + 1..]))
 }
 
-fn ssh_upload(
-    data: &[u8],
-    host: &str,
-    remote_path: &str,
+fn ssh_send(
+    patch: &[u8],
     sha1: &[u8],
-    pb: &ProgressBar,
+    host: &str,
+    output: &str,
+    base: Option<&str>,
 ) -> io::Result<()> {
-    pb.set_message(format!("uploading to {host}:{remote_path}…"));
+    let mut cmd_args: Vec<&str> = vec![host, "edelta", "receive", output];
+    if let Some(b) = base {
+        cmd_args.push(b);
+    }
     let mut child = Command::new("ssh")
-        .args([host, "edelta", "receive", remote_path])
+        .args(&cmd_args)
         .stdin(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
 
-    let stdin = child.stdin.take().unwrap();
-    let mut encoder = zstd::Encoder::new(stdin, 19)?;
-    encoder.write_all(data)?;
-    let mut stdin = encoder.finish()?;
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(patch)?;
     stdin.write_all(sha1)?;
     drop(stdin);
 
@@ -325,7 +328,7 @@ fn ssh_upload(
     } else {
         Err(io::Error::new(
             io::ErrorKind::Other,
-            "ssh upload failed",
+            "remote receive failed",
         ))
     }
 }
@@ -345,30 +348,15 @@ fn write_and_verify(
     expected_sha1: &[u8],
     base_path: Option<&str>,
 ) -> io::Result<()> {
-    let actual = if let Some(base) = base_path {
-        let base_data = read_file(base)?;
-        let le = resolve_endianness(None, &base_data);
-        let compressor = ZstdCompressor::default();
-        let result = decode_patch(&base_data, payload, le, &compressor)?;
-        let sha1 = sha1_digest(&result);
-        std::fs::write(tmp, &result)?;
-        sha1
-    } else {
-        let mut decoder = zstd::Decoder::new(io::Cursor::new(payload))?;
-        let mut hasher = Sha1::new();
-        let mut file = std::fs::File::create(tmp)?;
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = decoder.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            file.write_all(&buf[..n])?;
-        }
-        hasher.finalize()
+    let base_data = match base_path {
+        Some(p) => read_file(p)?,
+        None => Vec::new(),
     };
+    let le = resolve_endianness(None, &base_data);
+    let compressor = ZstdCompressor::default();
+    let result = decode_patch(&base_data, payload, le, &compressor)?;
 
+    let actual = sha1_digest(&result);
     if actual.as_slice() != expected_sha1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -379,6 +367,8 @@ fn write_and_verify(
             ),
         ));
     }
+
+    std::fs::write(tmp, &result)?;
     Ok(())
 }
 
@@ -410,6 +400,7 @@ fn do_push(
     remote_spec: &str,
     endian_override: Option<bool>,
     compressor: &dyn Compressor,
+    two_pass: bool,
 ) -> io::Result<()> {
     let (host, remote_path) = parse_remote(remote_spec).ok_or_else(|| {
         io::Error::new(
@@ -432,86 +423,85 @@ fn do_push(
     let local_sha1 = sha1_digest(&local_data);
     let local_hash = sha1_hex(local_sha1.as_slice());
 
-    // Ask the remote for the current file's SHA1
     pb.set_message(format!("querying {host}:{remote_path}…"));
     let remote_hash = remote_sha1(host, remote_path)?;
 
-    // Skip if unchanged
     if remote_hash.as_deref() == Some(local_hash.as_str()) {
         pb.finish_and_clear();
         eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
         return Ok(());
     }
 
-    // Try delta if we have the remote's version cached locally
-    if let Some(ref rh) = remote_hash {
-        let base_path = cache_dir().join(rh);
-        if base_path.exists() {
-            let base_data = std::fs::read(&base_path)?;
-            touch(&base_path);
-
-            pb.set_message(format!("computing delta for {local_path}…"));
-            let t0 = Instant::now();
-            let patch_data = encode_patch(&base_data, &local_data, le, compressor)?;
-            let delta_time = t0.elapsed();
-
-            pb.set_message(format!("patching {host}:{remote_path}…"));
-            let t0 = Instant::now();
-            let ssh_ok = (|| -> io::Result<bool> {
-                let mut child = Command::new("ssh")
-                    .args([host, "edelta", "receive", remote_path, remote_path])
-                    .stdin(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()?;
-
-                let mut stdin_pipe = child.stdin.take().unwrap();
-                stdin_pipe.write_all(&patch_data)?;
-                stdin_pipe.write_all(local_sha1.as_slice())?;
-                drop(stdin_pipe);
-
-                let status = child.wait()?;
-                Ok(status.success())
-            })();
-            let transfer_time = t0.elapsed();
-
-            match ssh_ok {
-                Ok(true) => {
-                    save_to_cache(&local_hash, &local_data)?;
-                    pb.finish_and_clear();
-
-                    let speedup = file_size as f64 / patch_data.len() as f64;
-                    let total_ms = (delta_time + transfer_time).as_millis();
-                    eprintln!(
-                        "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
-                         \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
-                         (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
-                        fmt_size(patch_data.len()),
-                        fmt_size(file_size),
-                        speedup,
-                    );
-                    return Ok(());
-                }
-                Ok(false) => {
-                    pb.set_message("ssh patch failed, falling back to full upload…");
-                }
-                Err(e) => {
-                    pb.set_message(format!("ssh error: {e}, falling back to full upload…"));
-                }
+    // Try delta against cached base, fall back to diff against empty
+    let (base_data, remote_base) = match remote_hash {
+        Some(ref rh) => {
+            let cached = cache_dir().join(rh);
+            if cached.exists() {
+                touch(&cached);
+                (std::fs::read(&cached)?, Some(remote_path))
+            } else {
+                (Vec::new(), None)
             }
         }
+        None => (Vec::new(), None),
+    };
+    let is_delta = remote_base.is_some();
+
+    pb.set_message(format!("encoding {local_path}…"));
+    let t0 = Instant::now();
+    let patch_data = encode_patch(&base_data, &local_data, le, compressor, two_pass)?;
+    let encode_time = t0.elapsed();
+
+    pb.set_message(format!("sending to {host}:{remote_path}…"));
+    let t0 = Instant::now();
+    let send_ok = ssh_send(
+        &patch_data,
+        local_sha1.as_slice(),
+        host,
+        remote_path,
+        remote_base,
+    );
+    let send_time = t0.elapsed();
+
+    // If delta failed on the remote, retry against empty base
+    if is_delta && send_ok.is_err() {
+        pb.set_message(format!("delta failed, resending {local_path}…"));
+        let t0 = Instant::now();
+        let patch_data = encode_patch(&[], &local_data, le, compressor, two_pass)?;
+        ssh_send(&patch_data, local_sha1.as_slice(), host, remote_path, None)?;
+        let elapsed = t0.elapsed().as_millis();
+        save_to_cache(&local_hash, &local_data)?;
+        pb.finish_and_clear();
+        eprintln!(
+            "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+             \x1b[1m{}\x1b[0m ({elapsed} ms)",
+            fmt_size(file_size),
+        );
+        return Ok(());
     }
 
-    // Full copy fallback
-    let t0 = Instant::now();
-    ssh_upload(&local_data, host, remote_path, local_sha1.as_slice(), &pb)?;
-    let elapsed = t0.elapsed().as_millis();
+    send_ok?;
     save_to_cache(&local_hash, &local_data)?;
     pb.finish_and_clear();
-    eprintln!(
-        "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
-         \x1b[1m{}\x1b[0m (full copy, {elapsed} ms)",
-        fmt_size(file_size),
-    );
+
+    let total_ms = (encode_time + send_time).as_millis();
+    if is_delta {
+        let speedup = file_size as f64 / patch_data.len() as f64;
+        eprintln!(
+            "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+             \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
+             (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
+            fmt_size(patch_data.len()),
+            fmt_size(file_size),
+            speedup,
+        );
+    } else {
+        eprintln!(
+            "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+             \x1b[1m{}\x1b[0m ({total_ms} ms)",
+            fmt_size(file_size),
+        );
+    }
     Ok(())
 }
 
@@ -520,19 +510,16 @@ fn do_push(
 fn usage(argv0: &str) -> ! {
     eprintln!("EDelta executable differ");
     eprintln!();
-    eprintln!("Usage: {argv0} [-le|-be] delta BASE VERSION [PATCH]");
-    eprintln!("       {argv0} [-le|-be] patch BASE OUTPUT  [PATCH]");
-    eprintln!("       {argv0} [-le|-be] push  LOCAL HOST:PATH");
+    eprintln!("Usage: {argv0} [flags] delta BASE VERSION [PATCH]");
+    eprintln!("       {argv0} [flags] patch BASE OUTPUT  [PATCH]");
+    eprintln!("       {argv0} [flags] push  LOCAL HOST:PATH");
     eprintln!();
-    eprintln!("  Endianness is auto-detected from the ELF/Mach-O/PE header.");
+    eprintln!("Flags:");
     eprintln!("  -le   Force little-endian     -be   Force big-endian");
+    eprintln!("  -2    Two-pass diff (smaller patches, slower)");
     eprintln!();
+    eprintln!("  Endianness is auto-detected from ELF/Mach-O/PE headers.");
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
-    eprintln!();
-    eprintln!("  push  Incrementally deploy LOCAL to a remote host via ssh.");
-    eprintln!("        Queries the remote SHA1, looks up a cached base in");
-    eprintln!("        ~/.edelta/cache/, and sends a delta. Falls back to");
-    eprintln!("        zstd-compressed full upload via ssh.");
     process::exit(1);
 }
 
@@ -542,17 +529,16 @@ fn main() {
 
     let mut rest = &args[1..];
     let mut endian_override: Option<bool> = None;
+    let mut two_pass = false;
 
-    match rest.first().map(|s| s.as_str()) {
-        Some("-le") => {
-            endian_override = Some(true);
-            rest = &rest[1..];
+    while let Some(flag) = rest.first().map(|s| s.as_str()) {
+        match flag {
+            "-le" => endian_override = Some(true),
+            "-be" => endian_override = Some(false),
+            "-2" => two_pass = true,
+            _ => break,
         }
-        Some("-be") => {
-            endian_override = Some(false);
-            rest = &rest[1..];
-        }
-        _ => {}
+        rest = &rest[1..];
     }
 
     if rest.len() < 2 {
@@ -573,6 +559,7 @@ fn main() {
                 rest.get(3).map(|s| s.as_str()),
                 endian_override,
                 &compressor,
+                two_pass,
             )
         }
         "patch" => {
@@ -591,7 +578,7 @@ fn main() {
             if rest.len() < 3 {
                 usage(argv0);
             }
-            do_push(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor)
+            do_push(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor, two_pass)
         }
         "receive" => {
             if rest.len() < 2 {
