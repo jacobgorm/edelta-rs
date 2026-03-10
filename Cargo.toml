@@ -3,6 +3,12 @@ name = "edelta"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
 [dependencies]
 filetime = "0.2"
 indicatif = "0.17"
