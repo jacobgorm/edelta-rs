@@ -330,38 +330,33 @@ fn ssh_upload(
     }
 }
 
-fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
+fn temp_path(target: &Path) -> io::Result<PathBuf> {
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let mut rng = [0u8; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut rng)?;
+    let suffix: String = rng.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(dir.join(format!(".{name}.{suffix}.tmp")))
+}
 
-    if input.len() < 20 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "input too short (missing SHA1 trailer)",
-        ));
-    }
-
-    let (payload, expected_sha1) = input.split_at(input.len() - 20);
-
-    let dest = Path::new(output_path);
-    let dir = dest.parent().unwrap_or(Path::new("."));
-    let name = dest.file_name().unwrap_or_default().to_string_lossy();
-    let tmp_path = dir.join(format!(".{name}.edelta-tmp"));
-
-    let actual_sha1 = if let Some(base) = base_path {
-        // Delta mode: payload is a patch file
+fn write_and_verify(
+    tmp: &Path,
+    payload: &[u8],
+    expected_sha1: &[u8],
+    base_path: Option<&str>,
+) -> io::Result<()> {
+    let actual = if let Some(base) = base_path {
         let base_data = read_file(base)?;
         let le = resolve_endianness(None, &base_data);
         let compressor = ZstdCompressor::default();
         let result = decode_patch(&base_data, payload, le, &compressor)?;
         let sha1 = sha1_digest(&result);
-        std::fs::write(&tmp_path, &result)?;
+        std::fs::write(tmp, &result)?;
         sha1
     } else {
-        // Full copy mode: stream decompress, hash, and write in one pass
         let mut decoder = zstd::Decoder::new(io::Cursor::new(payload))?;
         let mut hasher = Sha1::new();
-        let mut file = std::fs::File::create(&tmp_path)?;
+        let mut file = std::fs::File::create(tmp)?;
         let mut buf = [0u8; 65536];
         loop {
             let n = decoder.read(&mut buf)?;
@@ -374,20 +369,40 @@ fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
         hasher.finalize()
     };
 
-    if actual_sha1.as_slice() != expected_sha1 {
-        let _ = std::fs::remove_file(&tmp_path);
+    if actual.as_slice() != expected_sha1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "SHA1 mismatch (expected {}, got {})",
                 sha1_hex(expected_sha1),
-                sha1_hex(actual_sha1.as_slice()),
+                sha1_hex(actual.as_slice()),
             ),
         ));
     }
-
-    std::fs::rename(&tmp_path, output_path)?;
     Ok(())
+}
+
+fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+
+    if input.len() < 20 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input too short (missing SHA1 trailer)",
+        ));
+    }
+
+    let (payload, expected_sha1) = input.split_at(input.len() - 20);
+    let tmp = temp_path(Path::new(output_path))?;
+
+    match write_and_verify(&tmp, payload, expected_sha1, base_path) {
+        Ok(()) => std::fs::rename(&tmp, output_path),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 fn do_push(
