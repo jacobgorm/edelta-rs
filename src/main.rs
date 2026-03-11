@@ -765,6 +765,7 @@ fn usage(argv0: &str) -> ! {
     eprintln!("Usage: {argv0} [flags] delta BASE VERSION [PATCH]");
     eprintln!("       {argv0} [flags] patch BASE OUTPUT  [PATCH]");
     eprintln!("       {argv0} [flags] cp    SRC DST");
+    eprintln!("       ecp [flags] SRC DST");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  -le   Force little-endian     -be   Force big-endian");
@@ -773,12 +774,15 @@ fn usage(argv0: &str) -> ! {
     eprintln!("  Endianness is auto-detected from ELF/Mach-O/PE headers.");
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
     eprintln!("  SRC/DST: use host:path for remote, plain path for local.");
+    eprintln!("  Symlink or rename the binary to 'ecp' to use cp mode directly.");
     process::exit(1);
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let argv0 = args.first().map(|s| s.as_str()).unwrap_or("edelta");
+    let bin_name = Path::new(argv0).file_name().unwrap_or_default().to_string_lossy();
+    let implicit_cp = bin_name == "ecp";
 
     let mut rest = &args[1..];
     let mut endian_override: Option<bool> = None;
@@ -794,61 +798,65 @@ fn main() {
         rest = &rest[1..];
     }
 
-    if rest.len() < 2 {
+    let command = if implicit_cp {
+        "cp"
+    } else {
+        if rest.len() < 2 {
+            usage(argv0);
+        }
+        let cmd = rest[0].as_str();
+        rest = &rest[1..];
+        cmd
+    };
+
+    if rest.len() < 1 {
         usage(argv0);
     }
 
-    let command = rest[0].as_str();
     let compressor = ZstdCompressor::default();
 
     let result = match command {
         "delta" => {
-            if rest.len() < 3 {
+            if rest.len() < 2 {
                 usage(argv0);
             }
             do_diff(
+                rest[0].as_str(),
                 rest[1].as_str(),
-                rest[2].as_str(),
-                rest.get(3).map(|s| s.as_str()),
+                rest.get(2).map(|s| s.as_str()),
                 endian_override,
                 &compressor,
                 two_pass,
             )
         }
         "patch" => {
-            if rest.len() < 3 {
+            if rest.len() < 2 {
                 usage(argv0);
             }
             do_patch(
+                rest[0].as_str(),
                 rest[1].as_str(),
-                rest[2].as_str(),
-                rest.get(3).map(|s| s.as_str()),
+                rest.get(2).map(|s| s.as_str()),
                 endian_override,
                 &compressor,
             )
         }
-        "cp" | "push" => {
-            if rest.len() < 3 {
-                usage(argv0);
-            }
-            do_cp(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor, two_pass)
-        }
-        "send" => {
+        "cp" => {
             if rest.len() < 2 {
                 usage(argv0);
             }
+            do_cp(rest[0].as_str(), rest[1].as_str(), endian_override, &compressor, two_pass)
+        }
+        "send" => {
             do_send(
-                rest[1].as_str(),
-                rest.get(2).map(|s| s.as_str()),
+                rest[0].as_str(),
+                rest.get(1).map(|s| s.as_str()),
                 endian_override,
                 two_pass,
             )
         }
         "receive" => {
-            if rest.len() < 2 {
-                usage(argv0);
-            }
-            do_receive(rest[1].as_str(), rest.get(2).map(|s| s.as_str()))
+            do_receive(rest[0].as_str(), rest.get(1).map(|s| s.as_str()))
         }
         _ => {
             eprintln!("unknown command: {command}");
