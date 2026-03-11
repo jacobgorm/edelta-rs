@@ -467,6 +467,7 @@ fn do_send(
     file_path: &str,
     base_sha1_hex: Option<&str>,
     endian_override: Option<bool>,
+    compressor: &dyn Compressor,
     two_pass: bool,
 ) -> io::Result<()> {
     let data = read_file(file_path)?;
@@ -494,8 +495,7 @@ fn do_send(
     let base = base_data.as_deref().unwrap_or(&[]);
 
     let le = resolve_endianness(endian_override, &data);
-    let compressor = ZstdCompressor::default();
-    let patch = encode_patch(base, &data, le, &compressor, two_pass)?;
+    let patch = encode_patch(base, &data, le, compressor, two_pass)?;
 
     stdout.write_all(&[if is_delta { 0x02 } else { 0x01 }])?;
     stdout.write_all(&patch)?;
@@ -632,6 +632,7 @@ fn do_pull(
     remote_spec: &str,
     local_path: &str,
     endian_override: Option<bool>,
+    zstd_level: i32,
     two_pass: bool,
 ) -> io::Result<()> {
     let (host, raw_remote) = parse_remote(remote_spec).ok_or_else(|| {
@@ -660,7 +661,8 @@ fn do_pull(
     let mut cmd_args: Vec<String> = vec![host.into(), "edelta".into()];
     if let Some(true) = endian_override { cmd_args.push("-le".into()); }
     if let Some(false) = endian_override { cmd_args.push("-be".into()); }
-    if two_pass { cmd_args.push("-2".into()); }
+    if zstd_level != 3 { cmd_args.push(format!("-z{zstd_level}")); }
+    if two_pass { cmd_args.push("--2pass".into()); }
     cmd_args.push("send".into());
     cmd_args.push(raw_remote.into());
     if let Some(ref h) = local_sha1_hex {
@@ -739,13 +741,14 @@ fn do_cp(
     arg2: &str,
     endian_override: Option<bool>,
     compressor: &dyn Compressor,
+    zstd_level: i32,
     two_pass: bool,
 ) -> io::Result<()> {
     let a1_remote = parse_remote(arg1).is_some();
     let a2_remote = parse_remote(arg2).is_some();
     match (a1_remote, a2_remote) {
         (false, true) => do_push(arg1, arg2, endian_override, compressor, two_pass),
-        (true, false) => do_pull(arg1, arg2, endian_override, two_pass),
+        (true, false) => do_pull(arg1, arg2, endian_override, zstd_level, two_pass),
         (true, true) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "both source and destination are remote",
@@ -768,8 +771,9 @@ fn usage(argv0: &str) -> ! {
     eprintln!("       ecp [flags] SRC DST");
     eprintln!();
     eprintln!("Flags:");
-    eprintln!("  -le   Force little-endian     -be   Force big-endian");
-    eprintln!("  -2    Two-pass diff (smaller patches, slower)");
+    eprintln!("  -le      Force little-endian     -be  Force big-endian");
+    eprintln!("  -zN      Zstd compression level (default 3, max 19)");
+    eprintln!("  --2pass  Two-pass diff (smaller patches, slower)");
     eprintln!();
     eprintln!("  Endianness is auto-detected from ELF/Mach-O/PE headers.");
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
@@ -787,12 +791,19 @@ fn main() {
     let mut rest = &args[1..];
     let mut endian_override: Option<bool> = None;
     let mut two_pass = false;
+    let mut zstd_level: i32 = 3;
 
     while let Some(flag) = rest.first().map(|s| s.as_str()) {
         match flag {
             "-le" => endian_override = Some(true),
             "-be" => endian_override = Some(false),
-            "-2" => two_pass = true,
+            "--2pass" => two_pass = true,
+            _ if flag.starts_with("-z") => {
+                zstd_level = flag[2..].parse().unwrap_or_else(|_| {
+                    eprintln!("invalid zstd level: {}", &flag[2..]);
+                    process::exit(1);
+                });
+            }
             _ => break,
         }
         rest = &rest[1..];
@@ -813,7 +824,7 @@ fn main() {
         usage(argv0);
     }
 
-    let compressor = ZstdCompressor::default();
+    let compressor = ZstdCompressor::new(zstd_level);
 
     let result = match command {
         "delta" => {
@@ -845,13 +856,14 @@ fn main() {
             if rest.len() < 2 {
                 usage(argv0);
             }
-            do_cp(rest[0].as_str(), rest[1].as_str(), endian_override, &compressor, two_pass)
+            do_cp(rest[0].as_str(), rest[1].as_str(), endian_override, &compressor, zstd_level, two_pass)
         }
         "send" => {
             do_send(
                 rest[0].as_str(),
                 rest.get(1).map(|s| s.as_str()),
                 endian_override,
+                &compressor,
                 two_pass,
             )
         }

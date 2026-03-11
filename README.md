@@ -28,7 +28,8 @@ or `DST` can be `host:path` for remote operation. Direction is auto-detected.
 ### Flags
 
 - `-le` / `-be` — force little- or big-endian (auto-detected from ELF/Mach-O/PE headers by default)
-- `-2` — two-pass diff for smaller patches (slower)
+- `-zN` — zstd compression level (default 3, max 19)
+- `--2pass` — two-pass diff for smaller patches (slower)
 
 ### Examples
 
