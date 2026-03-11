@@ -56,3 +56,34 @@ ln -s target/release/edelta target/release/ecp   # optional shorthand
 ```
 
 Remote hosts need `edelta` in `$PATH` for `cp` to work.
+
+## Benchmark vs bsdiff
+
+Test corpus of 11 binary pairs (ELF, Mach-O, PE) on Apple M2 Max.
+
+| Test | File size | edelta -z3 | | edelta --2pass -z19 | | bsdiff | |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| | | **ratio** | **time** | **ratio** | **time** | **ratio** | **time** |
+| epiphany-ia32 | 848 KiB | 16.0% | 59ms | 12.8% | 105ms | 10.2% | 817ms |
+| hello-ppc | 55 B | 164% | 45ms | 164% | 52ms | 327% | 39ms |
+| runclient-ppc | 8.3 KiB | 13.9% | 50ms | 12.8% | 68ms | 6.0% | 40ms |
+| user32_12 | 541 KiB | 24.2% | 51ms | 24.2% | 103ms | 15.7% | 145ms |
+| user32_prebbt | 541 KiB | 5.9% | 61ms | 7.5% | 84ms | 5.0% | 107ms |
+| user32 | 563 KiB | 29.0% | 59ms | 32.4% | 113ms | 11.1% | 128ms |
+| vim-ppc | 1.0 MiB | 4.6% | 61ms | 5.0% | 94ms | 3.6% | 216ms |
+| vlad | 100 KiB | 102.9% | 56ms | 33.6% | 85ms | 28.2% | 75ms |
+| **warp-cli** | **15.0 MiB** | **0.012%** | **201ms** | **0.010%** | **309ms** | **0.001%** | **2192ms** |
+| wget-ppc | 259 KiB | 24.9% | 57ms | 20.2% | 96ms | 16.9% | 88ms |
+| xpdf-ppc | 848 KiB | 40.3% | 63ms | 33.2% | 196ms | 38.7% | 460ms |
+
+Ratio = patch size as % of the new file size. Lower is better.
+
+**Takeaways:**
+
+- edelta -z3 is **2-10x faster** than bsdiff, with moderately larger patches.
+- --2pass -z19 trades speed for ~10% better compression, but the two-pass
+  heuristic occasionally backfires (user32, user32_prebbt).
+- bsdiff generally compresses better on small test binaries thanks to its
+  suffix-sort algorithm.
+- On large near-identical binaries (warp-cli), all tools produce tiny patches
+  but edelta is 10x faster (201ms vs 2192ms).
