@@ -463,6 +463,50 @@ fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
     }
 }
 
+fn do_send(
+    file_path: &str,
+    base_sha1_hex: Option<&str>,
+    endian_override: Option<bool>,
+    two_pass: bool,
+) -> io::Result<()> {
+    let data = read_file(file_path)?;
+    let file_sha1 = sha1_digest(&data);
+    let file_sha1_hex = sha1_hex(file_sha1.as_slice());
+    let mode = std::fs::metadata(file_path)?.permissions().mode();
+
+    let mut stdout = io::stdout().lock();
+
+    if base_sha1_hex == Some(file_sha1_hex.as_str()) {
+        stdout.write_all(&[0x00])?;
+        return Ok(());
+    }
+
+    let base_data = base_sha1_hex.and_then(|h| {
+        let cached = cache_dir().join(h);
+        if cached.exists() {
+            touch(&cached);
+            std::fs::read(&cached).ok()
+        } else {
+            None
+        }
+    });
+    let is_delta = base_data.is_some();
+    let base = base_data.as_deref().unwrap_or(&[]);
+
+    let le = resolve_endianness(endian_override, &data);
+    let compressor = ZstdCompressor::default();
+    let patch = encode_patch(base, &data, le, &compressor, two_pass)?;
+
+    stdout.write_all(&[if is_delta { 0x02 } else { 0x01 }])?;
+    stdout.write_all(&patch)?;
+    stdout.write_all(file_sha1.as_slice())?;
+    stdout.write_all(&(mode as u16).to_be_bytes())?;
+    stdout.flush()?;
+
+    save_to_cache(&file_sha1_hex, &data)?;
+    Ok(())
+}
+
 fn do_push(
     local_path: &str,
     remote_spec: &str,
@@ -584,6 +628,135 @@ fn do_push(
     Ok(())
 }
 
+fn do_pull(
+    remote_spec: &str,
+    local_path: &str,
+    endian_override: Option<bool>,
+    two_pass: bool,
+) -> io::Result<()> {
+    let (host, raw_remote) = parse_remote(remote_spec).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid remote spec '{remote_spec}', expected host:path"),
+        )
+    })?;
+
+    let local_buf;
+    let local_path = if local_path.ends_with('/') || Path::new(local_path).is_dir() {
+        let name = Path::new(raw_remote).file_name().unwrap_or_default().to_string_lossy();
+        local_buf = Path::new(local_path).join(name.as_ref()).to_string_lossy().into_owned();
+        local_buf.as_str()
+    } else {
+        local_path
+    };
+
+    let local_sha1_hex = if Path::new(local_path).exists() {
+        let data = read_file(local_path)?;
+        Some(sha1_hex(sha1_digest(&data).as_slice()))
+    } else {
+        None
+    };
+
+    let mut cmd_args: Vec<String> = vec![host.into(), "edelta".into()];
+    if let Some(true) = endian_override { cmd_args.push("-le".into()); }
+    if let Some(false) = endian_override { cmd_args.push("-be".into()); }
+    if two_pass { cmd_args.push("-2".into()); }
+    cmd_args.push("send".into());
+    cmd_args.push(raw_remote.into());
+    if let Some(ref h) = local_sha1_hex {
+        cmd_args.push(h.clone());
+    }
+
+    let t0 = Instant::now();
+    let output = Command::new("ssh")
+        .args(&cmd_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "remote send failed"));
+    }
+
+    let response = &output.stdout;
+    if response.is_empty() || response[0] == 0x00 {
+        eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
+        return Ok(());
+    }
+
+    let flag = response[0];
+    let rest = &response[1..];
+    if rest.len() < 22 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response too short",
+        ));
+    }
+
+    let (rest2, mode_bytes) = rest.split_at(rest.len() - 2);
+    let mode = u16::from_be_bytes([mode_bytes[0], mode_bytes[1]]) as u32;
+    let (payload, expected_sha1) = rest2.split_at(rest2.len() - 20);
+
+    let base_path = if flag == 0x02 { Some(local_path) } else { None };
+
+    let tmp = temp_path(Path::new(local_path))?;
+    match write_and_verify(&tmp, payload, expected_sha1, base_path) {
+        Ok(()) => {
+            std::fs::set_permissions(&tmp, PermissionsExt::from_mode(mode))?;
+            std::fs::rename(&tmp, local_path)?;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+
+    let elapsed = t0.elapsed();
+    let file_size = std::fs::metadata(local_path)?.len() as usize;
+    let total_ms = elapsed.as_millis();
+    if flag == 0x02 {
+        let speedup = file_size as f64 / payload.len() as f64;
+        eprintln!(
+            "\x1b[32m✓\x1b[0m {host}:{raw_remote} → {local_path}  \
+             \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
+             (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
+            fmt_size(payload.len()),
+            fmt_size(file_size),
+            speedup,
+        );
+    } else {
+        eprintln!(
+            "\x1b[32m✓\x1b[0m {host}:{raw_remote} → {local_path}  \
+             \x1b[1m{}\x1b[0m ({total_ms} ms)",
+            fmt_size(file_size),
+        );
+    }
+    Ok(())
+}
+
+fn do_cp(
+    arg1: &str,
+    arg2: &str,
+    endian_override: Option<bool>,
+    compressor: &dyn Compressor,
+    two_pass: bool,
+) -> io::Result<()> {
+    let a1_remote = parse_remote(arg1).is_some();
+    let a2_remote = parse_remote(arg2).is_some();
+    match (a1_remote, a2_remote) {
+        (false, true) => do_push(arg1, arg2, endian_override, compressor, two_pass),
+        (true, false) => do_pull(arg1, arg2, endian_override, two_pass),
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "both source and destination are remote",
+        )),
+        (false, false) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "neither source nor destination is remote",
+        )),
+    }
+}
+
 // ── arg parsing & usage ─────────────────────────────────────────────────────
 
 fn usage(argv0: &str) -> ! {
@@ -591,7 +764,7 @@ fn usage(argv0: &str) -> ! {
     eprintln!();
     eprintln!("Usage: {argv0} [flags] delta BASE VERSION [PATCH]");
     eprintln!("       {argv0} [flags] patch BASE OUTPUT  [PATCH]");
-    eprintln!("       {argv0} [flags] push  LOCAL HOST:PATH");
+    eprintln!("       {argv0} [flags] cp    SRC DST");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  -le   Force little-endian     -be   Force big-endian");
@@ -599,6 +772,7 @@ fn usage(argv0: &str) -> ! {
     eprintln!();
     eprintln!("  Endianness is auto-detected from ELF/Mach-O/PE headers.");
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
+    eprintln!("  SRC/DST: use host:path for remote, plain path for local.");
     process::exit(1);
 }
 
@@ -653,11 +827,22 @@ fn main() {
                 &compressor,
             )
         }
-        "push" => {
+        "cp" | "push" => {
             if rest.len() < 3 {
                 usage(argv0);
             }
-            do_push(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor, two_pass)
+            do_cp(rest[1].as_str(), rest[2].as_str(), endian_override, &compressor, two_pass)
+        }
+        "send" => {
+            if rest.len() < 2 {
+                usage(argv0);
+            }
+            do_send(
+                rest[1].as_str(),
+                rest.get(2).map(|s| s.as_str()),
+                endian_override,
+                two_pass,
+            )
         }
         "receive" => {
             if rest.len() < 2 {
