@@ -6,6 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::MmapMut;
 use sha1::{Digest, Sha1};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -25,6 +26,20 @@ fn fnv1a(data: &[u8]) -> u32 {
 
 fn read_file(path: &str) -> io::Result<Vec<u8>> {
     std::fs::read(path)
+}
+
+fn file_mode(path: &str) -> io::Result<u32> {
+    #[cfg(unix)]
+    { Ok(std::fs::metadata(path)?.permissions().mode()) }
+    #[cfg(not(unix))]
+    { let _ = path; Ok(0o100755) }
+}
+
+fn set_file_mode(path: &Path, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    { std::fs::set_permissions(path, PermissionsExt::from_mode(mode)) }
+    #[cfg(not(unix))]
+    { let _ = (path, mode); Ok(()) }
 }
 
 // ── Endianness detection from executable headers ────────────────────────────
@@ -349,18 +364,20 @@ fn ssh_send(
     }
 }
 
-fn temp_path(target: &Path) -> io::Result<PathBuf> {
+fn temp_path(target: &Path) -> PathBuf {
     let dir = target.parent().unwrap_or(Path::new("."));
     let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let mut rng = [0u8; 8];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut rng)?;
-    let suffix: String = rng.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(dir.join(format!(".{name}.{suffix}.tmp")))
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    dir.join(format!(".{name}.{suffix}.tmp"))
 }
 
 fn mmap_file(path: &str) -> io::Result<memmap2::Mmap> {
     let file = std::fs::File::open(path)?;
     let m = unsafe { memmap2::Mmap::map(&file)? };
+    #[cfg(unix)]
     m.advise(memmap2::Advice::WillNeed)?;
     Ok(m)
 }
@@ -405,6 +422,7 @@ fn write_and_verify(
     }
 
     let mut out = unsafe { MmapMut::map_mut(&out_file)? };
+    #[cfg(unix)]
     out.advise(memmap2::Advice::Sequential)?;
 
     delta::patch_into(base, patch_data, le, &mut out)
@@ -449,11 +467,11 @@ fn do_receive(output_path: &str, base_path: Option<&str>) -> io::Result<()> {
     let (rest, mode_bytes) = input.split_at(input.len() - 2);
     let mode = u16::from_be_bytes([mode_bytes[0], mode_bytes[1]]) as u32;
     let (payload, expected_sha1) = rest.split_at(rest.len() - 20);
-    let tmp = temp_path(Path::new(output_path))?;
+    let tmp = temp_path(Path::new(output_path));
 
     match write_and_verify(&tmp, payload, expected_sha1, base_path) {
         Ok(()) => {
-            std::fs::set_permissions(&tmp, PermissionsExt::from_mode(mode))?;
+            set_file_mode(&tmp, mode)?;
             std::fs::rename(&tmp, output_path)
         }
         Err(e) => {
@@ -473,7 +491,7 @@ fn do_send(
     let data = read_file(file_path)?;
     let file_sha1 = sha1_digest(&data);
     let file_sha1_hex = sha1_hex(file_sha1.as_slice());
-    let mode = std::fs::metadata(file_path)?.permissions().mode();
+    let mode = file_mode(file_path)?;
 
     let mut stdout = io::stdout().lock();
 
@@ -538,7 +556,7 @@ fn do_push(
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    let local_mode = std::fs::metadata(local_path)?.permissions().mode();
+    let local_mode = file_mode(local_path)?;
     let local_data = read_file(local_path)?;
     let le = resolve_endianness(endian_override, &local_data);
     let file_size = local_data.len();
@@ -701,10 +719,10 @@ fn do_pull(
 
     let base_path = if flag == 0x02 { Some(local_path) } else { None };
 
-    let tmp = temp_path(Path::new(local_path))?;
+    let tmp = temp_path(Path::new(local_path));
     match write_and_verify(&tmp, payload, expected_sha1, base_path) {
         Ok(()) => {
-            std::fs::set_permissions(&tmp, PermissionsExt::from_mode(mode))?;
+            set_file_mode(&tmp, mode)?;
             std::fs::rename(&tmp, local_path)?;
         }
         Err(e) => {
