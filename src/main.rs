@@ -12,6 +12,19 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::time::Instant;
 
+/// Set stdin and stdout to binary mode on Windows (no \r\n translation).
+#[cfg(windows)]
+fn set_binary_mode() {
+    extern "C" { fn _setmode(fd: i32, mode: i32) -> i32; }
+    const O_BINARY: i32 = 0x8000;
+    unsafe {
+        _setmode(0, O_BINARY); // stdin
+        _setmode(1, O_BINARY); // stdout
+    }
+}
+#[cfg(not(windows))]
+fn set_binary_mode() {}
+
 const MAGIC: &[u8; 4] = b"EDLT";
 const FORMAT_VERSION: u8 = 2;
 
@@ -309,16 +322,37 @@ fn sha1_hex(digest: &[u8]) -> String {
 }
 
 fn remote_sha1(host: &str, path: &str) -> io::Result<Option<String>> {
+    // Try shasum (Unix/macOS), then certutil (Windows)
     let output = Command::new("ssh")
         .args([host, &format!("shasum {path}")])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()?;
-    if !output.status.success() {
-        return Ok(None);
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(hash) = stdout.split_whitespace().next() {
+            return Ok(Some(hash.to_string()));
+        }
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.split_whitespace().next().map(|s| s.to_string()))
+
+    // certutil -hashfile <path> SHA1 outputs the hash on the second line
+    let output = Command::new("ssh")
+        .args([host, &format!("certutil -hashfile \"{path}\" SHA1")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // certutil output: line 1 = header, line 2 = hex hash (with spaces), line 3 = trailer
+        if let Some(hash_line) = stdout.lines().nth(1) {
+            let hash: String = hash_line.split_whitespace().collect();
+            if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(Some(hash));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn parse_remote(spec: &str) -> Option<(&str, &str)> {
@@ -801,6 +835,7 @@ fn usage(argv0: &str) -> ! {
 }
 
 fn main() {
+    set_binary_mode();
     let args: Vec<String> = std::env::args().collect();
     let argv0 = args.first().map(|s| s.as_str()).unwrap_or("edelta");
     let bin_name = Path::new(argv0).file_name().unwrap_or_default().to_string_lossy();
