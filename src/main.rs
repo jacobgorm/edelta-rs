@@ -10,7 +10,10 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+static QUIET: AtomicBool = AtomicBool::new(false);
 
 /// Set stdin and stdout to binary mode on Windows (no \r\n translation).
 #[cfg(windows)]
@@ -220,13 +223,15 @@ fn do_diff(
         None => io::stdout().write_all(&out_data)?,
     }
 
-    eprintln!(
-        "base {} bytes, version {} bytes, patch {} bytes ({})",
-        base.len(),
-        version.len(),
-        out_data.len(),
-        if le { "LE" } else { "BE" },
-    );
+    if !QUIET.load(Ordering::Relaxed) {
+        eprintln!(
+            "base {} bytes, version {} bytes, patch {} bytes ({})",
+            base.len(),
+            version.len(),
+            out_data.len(),
+            if le { "LE" } else { "BE" },
+        );
+    }
     Ok(())
 }
 
@@ -252,7 +257,9 @@ fn do_patch(
     let result = decode_patch(&base, &patch_file, le, compressor)?;
 
     std::fs::write(output_path, &result)?;
-    eprintln!("patched {} bytes -> {} bytes", base.len(), result.len());
+    if !QUIET.load(Ordering::Relaxed) {
+        eprintln!("patched {} bytes -> {} bytes", base.len(), result.len());
+    }
     Ok(())
 }
 
@@ -582,13 +589,19 @@ fn do_push(
         raw_remote
     };
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    let quiet = QUIET.load(Ordering::Relaxed);
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        pb
+    };
 
     let local_mode = file_mode(local_path)?;
     let local_data = read_file(local_path)?;
@@ -602,7 +615,9 @@ fn do_push(
 
     if remote_hash.as_deref() == Some(local_hash.as_str()) {
         pb.finish_and_clear();
-        eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
+        if !quiet {
+            eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
+        }
         return Ok(());
     }
 
@@ -647,11 +662,13 @@ fn do_push(
         let elapsed = t0.elapsed().as_millis();
         save_to_cache(&local_hash, &local_data)?;
         pb.finish_and_clear();
-        eprintln!(
-            "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
-             \x1b[1m{}\x1b[0m ({elapsed} ms)",
-            fmt_size(file_size),
-        );
+        if !quiet {
+            eprintln!(
+                "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+                 \x1b[1m{}\x1b[0m ({elapsed} ms)",
+                fmt_size(file_size),
+            );
+        }
         return Ok(());
     }
 
@@ -659,23 +676,25 @@ fn do_push(
     save_to_cache(&local_hash, &local_data)?;
     pb.finish_and_clear();
 
-    let total_ms = (encode_time + send_time).as_millis();
-    if is_delta {
-        let speedup = file_size as f64 / patch_data.len() as f64;
-        eprintln!(
-            "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
-             \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
-             (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
-            fmt_size(patch_data.len()),
-            fmt_size(file_size),
-            speedup,
-        );
-    } else {
-        eprintln!(
-            "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
-             \x1b[1m{}\x1b[0m ({total_ms} ms)",
-            fmt_size(file_size),
-        );
+    if !quiet {
+        let total_ms = (encode_time + send_time).as_millis();
+        if is_delta {
+            let speedup = file_size as f64 / patch_data.len() as f64;
+            eprintln!(
+                "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+                 \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
+                 (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
+                fmt_size(patch_data.len()),
+                fmt_size(file_size),
+                speedup,
+            );
+        } else {
+            eprintln!(
+                "\x1b[32m✓\x1b[0m {local_path} → {host}:{remote_path}  \
+                 \x1b[1m{}\x1b[0m ({total_ms} ms)",
+                fmt_size(file_size),
+            );
+        }
     }
     Ok(())
 }
@@ -734,7 +753,9 @@ fn do_pull(
 
     let response = &output.stdout;
     if response.is_empty() || response[0] == 0x00 {
-        eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
+        if !QUIET.load(Ordering::Relaxed) {
+            eprintln!("\x1b[90m{local_path}: unchanged, skipping\x1b[0m");
+        }
         return Ok(());
     }
 
@@ -765,25 +786,27 @@ fn do_pull(
         }
     }
 
-    let elapsed = t0.elapsed();
-    let file_size = std::fs::metadata(local_path)?.len() as usize;
-    let total_ms = elapsed.as_millis();
-    if flag == 0x02 {
-        let speedup = file_size as f64 / payload.len() as f64;
-        eprintln!(
-            "\x1b[32m✓\x1b[0m {host}:{raw_remote} → {local_path}  \
-             \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
-             (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
-            fmt_size(payload.len()),
-            fmt_size(file_size),
-            speedup,
-        );
-    } else {
-        eprintln!(
-            "\x1b[32m✓\x1b[0m {host}:{raw_remote} → {local_path}  \
-             \x1b[1m{}\x1b[0m ({total_ms} ms)",
-            fmt_size(file_size),
-        );
+    if !QUIET.load(Ordering::Relaxed) {
+        let elapsed = t0.elapsed();
+        let file_size = std::fs::metadata(local_path)?.len() as usize;
+        let total_ms = elapsed.as_millis();
+        if flag == 0x02 {
+            let speedup = file_size as f64 / payload.len() as f64;
+            eprintln!(
+                "\x1b[32m✓\x1b[0m {host}:{raw_remote} → {local_path}  \
+                 \x1b[1m{}\x1b[0m patch for \x1b[1m{}\x1b[0m file \
+                 (\x1b[33m{:.1}×\x1b[0m smaller, {total_ms} ms)",
+                fmt_size(payload.len()),
+                fmt_size(file_size),
+                speedup,
+            );
+        } else {
+            eprintln!(
+                "\x1b[32m✓\x1b[0m {host}:{raw_remote} → {local_path}  \
+                 \x1b[1m{}\x1b[0m ({total_ms} ms)",
+                fmt_size(file_size),
+            );
+        }
     }
     Ok(())
 }
@@ -826,6 +849,7 @@ fn usage(argv0: &str) -> ! {
     eprintln!("  -le      Force little-endian     -be  Force big-endian");
     eprintln!("  -zN      Zstd compression level (default 3, max 19)");
     eprintln!("  --2pass  Two-pass diff (smaller patches, slower)");
+    eprintln!("  -q       Quiet (suppress progress and status output)");
     eprintln!();
     eprintln!("  Endianness is auto-detected from ELF/Mach-O/PE headers.");
     eprintln!("  If PATCH is omitted, stdin/stdout is used.");
@@ -850,6 +874,7 @@ fn main() {
         match flag {
             "-le" => endian_override = Some(true),
             "-be" => endian_override = Some(false),
+            "-q" => QUIET.store(true, Ordering::Relaxed),
             "--2pass" => two_pass = true,
             _ if flag.starts_with("-z") => {
                 zstd_level = flag[2..].parse().unwrap_or_else(|_| {
