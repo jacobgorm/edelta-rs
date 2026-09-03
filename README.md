@@ -30,6 +30,7 @@ or `DST` can be `host:path` for remote operation. Direction is auto-detected.
 - `-le` / `-be` — force little- or big-endian (auto-detected from ELF/Mach-O/PE headers by default)
 - `-zN` — zstd compression level (default 3, max 19)
 - `--2pass` — two-pass diff for smaller patches (slower)
+- `-q` — quiet mode (suppress progress bars and status output)
 
 ### Examples
 
