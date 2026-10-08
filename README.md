@@ -58,6 +58,19 @@ ln -s target/release/edelta target/release/ecp   # optional shorthand
 
 Remote hosts need `edelta` in `$PATH` for `cp` to work.
 
+To cross compile for Intel Linux from macOS, install the Rust target, Zig, and
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild):
+
+```
+rustup target add x86_64-unknown-linux-gnu
+brew install zig
+uv tool install cargo-zigbuild
+make intellinux
+```
+
+The binary is written to `target/x86_64-unknown-linux-gnu/release/edelta`
+and requires a Haswell or newer CPU, matching the other Intel Makefile targets.
+
 ## Benchmark vs bsdiff
 
 Test corpus of 11 binary pairs (ELF, Mach-O, PE) on Apple M2 Max.

@@ -4,5 +4,8 @@ armmac:
 intelmac:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin
 
+intellinux:
+	RUSTFLAGS='-C target-cpu=haswell' cargo zigbuild --release --target x86_64-unknown-linux-gnu
+
 intelwin:
 	RUSTFLAGS='-C target-cpu=haswell' cargo xwin build --release --target x86_64-pc-windows-msvc
